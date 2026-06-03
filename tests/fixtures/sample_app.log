@@ -1,0 +1,9 @@
+2026-06-03 10:00:01.001 INFO  [http-listener] org.mule.runtime - Received request GET /orders [correlationId: order-001]
+2026-06-03 10:00:01.050 INFO  [flow:get-orders] com.acme.api - Validating order request [correlationId: order-001]
+2026-06-03 10:00:01.120 INFO  [flow:get-orders] com.acme.api - Order lookup succeeded, returning 200 [correlationId: order-001]
+2026-06-03 10:00:02.001 INFO  [http-listener] org.mule.runtime - Received request POST /payments [correlationId: pay-042]
+2026-06-03 10:00:02.080 WARN  [flow:make-payment] com.acme.api - Payment gateway slow response [correlationId: pay-042]
+2026-06-03 10:00:02.300 ERROR [flow:make-payment] com.acme.api - Payment declined: insufficient funds [correlationId: pay-042]
+2026-06-03 10:00:03.001 INFO  [http-listener] org.mule.runtime - Received request GET /health [correlationId: health-check-99]
+2026-06-03 10:00:03.010 INFO  [flow:health] com.acme.api - Health OK [correlationId: health-check-99]
+2026-06-03 10:00:04.000 INFO  [scheduler] org.mule.runtime - Heartbeat tick with no correlation context

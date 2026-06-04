@@ -18,10 +18,13 @@ numbers-parser smart-quote round-trip glitch), the file is restored from the bac
 from __future__ import annotations
 
 import datetime
+import json
+import re
 import shutil
 from pathlib import Path
+from typing import Any
 
-from ..models import CaseReport, SuiteReport
+from ..models import CaseEvidence, CaseReport, SuiteReport
 from .suite import RESULTS_MARKER, _as_str, _find_header_row, _load_rows
 
 RESULTS_HEADER = [
@@ -138,10 +141,27 @@ def _append_xlsx(file_path: Path, block: list[list[str]]) -> None:
         (workbook[name] for name in workbook.sheetnames if name.lower() == "tests"),
         workbook.active,
     )
-    sheet.append([])  # blank separator
+    # ``sheet.append`` anchors on openpyxl's tracked max row, which for sheets exported from
+    # Google Sheets is padded with ~1000 phantom empty rows — that would bury the block far
+    # below the data. Anchor on the true last non-empty row and write from there instead.
+    row = _last_data_row(sheet) + 2  # +1 blank separator, then the block
     for line in block:
-        sheet.append(line)
+        for col, val in enumerate(line, start=1):
+            sheet.cell(row=row, column=col, value=val)
+        row += 1
     workbook.save(file_path)
+
+
+def _last_data_row(sheet) -> int:
+    """The 1-based index of the last row holding any non-empty cell (0 if the sheet is empty)."""
+    last = 0
+    for r in range(1, sheet.max_row + 1):
+        if any(
+            (sheet.cell(row=r, column=c).value not in (None, ""))
+            for c in range(1, sheet.max_column + 1)
+        ):
+            last = r
+    return last
 
 
 # --- verification ----------------------------------------------------------------------
@@ -173,13 +193,161 @@ def _case_region(file_path: Path) -> list[list[str]]:
     return region
 
 
+# --- per-case evidence tabs ------------------------------------------------------------
+
+
+def write_evidence_tabs(path: str, evidence: list[CaseEvidence], run_at: str) -> None:
+    """Overwrite one sheet tab per test case with the latest run's evidence.
+
+    Each case gets its own tab (named after its ``test_id``) holding the request, the response
+    validation, and the actual log lines that matched — overwritten in place so only the latest
+    run is kept. This is additive to (and independent of) the stacked ``RESULTS`` summary block
+    that ``write_results`` appends to the ``tests`` sheet.
+
+    xlsx/.xlsm only; a no-op for other formats. The ``tests`` definition region is backed up and
+    verified unchanged (it lives on a different sheet, so this is a belt-and-braces guard).
+    """
+    file_path = Path(path)
+    if file_path.suffix.lower() not in {".xlsx", ".xlsm"} or not evidence:
+        return
+
+    backup = file_path.with_name(
+        f"{file_path.stem}.bak-{datetime.datetime.now():%Y%m%d-%H%M%S}-evi{file_path.suffix}"
+    )
+    shutil.copy2(file_path, backup)
+
+    before = _case_region(file_path)
+    _write_evidence_xlsx(file_path, evidence, run_at)
+    after = _case_region(file_path)
+    if after != before:
+        shutil.copy2(backup, file_path)
+        raise ResultsWriteError(
+            f"evidence write altered the test-definition rows; restored ({backup.name})"
+        )
+
+    backup.unlink(missing_ok=True)
+
+
+def _write_evidence_xlsx(file_path: Path, evidence: list[CaseEvidence], run_at: str) -> None:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(filename=file_path)
+    used: set[str] = set()
+    for ev in evidence:
+        name = _safe_sheet_name(ev.test_id, used)
+        if name in workbook.sheetnames:
+            workbook.remove(workbook[name])  # override: keep only the latest evidence
+        sheet = workbook.create_sheet(title=name)
+        _fill_evidence_sheet(sheet, ev, run_at)
+    workbook.save(file_path)
+
+
+_INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
+
+
+def _safe_sheet_name(test_id: str, used: set[str]) -> str:
+    """An Excel-legal, stable, unique tab name for a test id (<=31 chars, no ``[]:*?/\\``)."""
+    base = (_INVALID_SHEET_CHARS.sub("_", test_id).strip() or "case")[:31]
+    if base.casefold() == "tests":  # never collide with the suite sheet
+        base = f"{base}_evi"[:31]
+    name, n = base, 2
+    while name.casefold() in used:
+        suffix = f"~{n}"
+        name = base[: 31 - len(suffix)] + suffix
+        n += 1
+    used.add(name.casefold())
+    return name
+
+
+def _fill_evidence_sheet(sheet, ev: CaseEvidence, run_at: str) -> None:
+    """Lay out one case's evidence as vertical key/value sections."""
+    rows: list[list[Any]] = [
+        [f"{ev.test_id} — evidence", f"run {run_at}", f"RESULT: {'PASS' if ev.passed else 'FAIL'}"],
+    ]
+    if ev.description:
+        rows.append([ev.description])
+    if ev.error:
+        rows.append(["error", ev.error])
+
+    rows += [[], ["[Request]"]]
+    rows.append(["method", ev.method or ""])
+    rows.append(["url", ev.url or ""])
+    rows.append(["headers", _json(ev.request_headers)])
+    rows.append(["body", _json(ev.request_body)])
+
+    resp_status = "" if ev.response_passed is None else ("PASS" if ev.response_passed else "FAIL")
+    rows += [[], ["[Response validation]", resp_status]]
+    rows.append(["expected_status", _s(ev.expected_status)])
+    rows.append(["actual_status", _s(ev.actual_status)])
+    rows.append(["match_mode", _s(ev.match_mode)])
+    rows.append(["latency_ms", "" if ev.latency_ms is None else _s(round(ev.latency_ms, 1))])
+    if ev.response_diffs:
+        rows.append(["diffs"])
+        for d in ev.response_diffs:
+            rows.append(["", f"{d.path}: {d.message} "
+                             f"(expected={d.expected!r}, actual={d.actual!r})"])
+    else:
+        rows.append(["diffs", "(none)"])
+    rows.append(["actual_body", _json(ev.actual_body)])
+
+    if not ev.validated_logs:
+        log_status = "not validated"
+    else:
+        log_status = "PASS" if ev.logs_passed else "FAIL"
+    rows += [[], ["[Log validation]", log_status]]
+    if ev.validated_logs:
+        rows.append(["log_source", ev.log_source or ""])
+        rows.append(["correlation_id", ev.correlation_id or ""])
+        rows.append(["used_fallback", "yes (whole-log)" if ev.used_fallback else "no"])
+        rows.append(["lines_considered", _s(ev.lines_considered)])
+        rows += [[], ["expected_log_string", "matched_lines"]]
+        for needle in ev.expected_log_strings:
+            lines = ev.matched_log_lines.get(needle, [])
+            rows.append([needle, lines[0] if lines else ""])  # blank when nothing matched
+            for extra in lines[1:]:
+                rows.append(["", extra])
+
+    for r, line in enumerate(rows, start=1):
+        for c, val in enumerate(line, start=1):
+            if val not in (None, ""):
+                sheet.cell(row=r, column=c, value=val)
+
+
+def _json(value: Any) -> str:
+    """Render a header/body cell: strings as-is, dict/list pretty-printed JSON."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _s(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
 def _normalize_row(row: list) -> list[str]:
     """Row as trimmed strings with trailing empties removed.
 
     Trailing-cell trimming matters because appending a wider results block pads the existing
     (narrower) definition rows with empty cells — that is not a content change.
     """
-    cells = [_as_str(c) or "" for c in row]
+    cells = [_canon_cell(c) for c in row]
     while cells and cells[-1] == "":
         cells.pop()
     return cells
+
+
+def _canon_cell(value) -> str:
+    """Stringify a cell, treating an integer-valued float as its int form.
+
+    Sheets exported from Google Sheets store whole numbers as floats (``201.0``); openpyxl
+    rewrites them as ints (``201``) on save. That round-trip is not a content change, so the
+    before/after guard must not flag it.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return _as_str(value) or ""

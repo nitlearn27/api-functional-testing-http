@@ -4,8 +4,11 @@ Implements ``snapshot()`` against the CloudHub 2.0 log-file endpoint configured 
 (``application_logs_fetch_url``). One download per run (the snapshot store reuses it across all
 cases), with a small bounded backoff on transient 429/500 responses.
 
-The log URL is fixed for now; ``_log_url()`` isolates it so a future change to build the URL
-dynamically from application id + version is a one-method edit.
+The configured URL is a ``.../deployments/{id}/specs/{version}/logs/file`` template. The spec
+``{version}`` changes on **every redeploy** (a new spec + new replicas), so a pinned version
+silently serves the old, shut-down replica's logs. ``_log_url()`` therefore resolves the
+deployment's *current* version at fetch time and rebuilds the URL, falling back to the
+configured URL as-is if the shape is unexpected or resolution fails.
 """
 
 from __future__ import annotations
@@ -49,13 +52,12 @@ class AnypointLogSource(LogSource):
         return [_INSTANCE]
 
     def snapshot(self, instances: list[str] | None = None) -> RawSnapshot:
-        url = self._log_url()
-        if not url:
-            raise AnypointLogError("application_logs_fetch_url is not set in .env")
-
         owns = self._client is None
         client = self._client or httpx.Client(timeout=_DEFAULT_TIMEOUT)
         try:
+            url = self._log_url(client)
+            if not url:
+                raise AnypointLogError("application_logs_fetch_url is not set in .env")
             response = self._get_with_retry(client, url)
         finally:
             if owns:
@@ -64,9 +66,34 @@ class AnypointLogSource(LogSource):
         lines = _parse_log_body(response)
         return RawSnapshot(lines_by_instance={_INSTANCE: lines})
 
-    def _log_url(self) -> str | None:
-        """The CloudHub log-file URL. Isolated for future dynamic construction."""
-        return self._settings.application_logs_fetch_url
+    def _log_url(self, client: httpx.Client) -> str | None:
+        """Resolve the log-file URL, swapping the pinned spec for the deployment's live version.
+
+        Reads ``desiredVersion`` (the running spec) from the deployment and rebuilds
+        ``.../deployments/{id}/specs/{liveVersion}/logs/file``. If the configured URL is not in
+        that shape, or the lookup fails, the configured URL is returned unchanged.
+        """
+        configured = self._settings.application_logs_fetch_url
+        if not configured or "/specs/" not in configured:
+            return configured
+
+        base, spec_tail = configured.split("/specs/", 1)  # base=.../deployments/{id}
+        tail = spec_tail.split("/", 1)[1] if "/" in spec_tail else "logs/file"  # "logs/file"
+        try:
+            version = self._current_version(client, base)
+        except (httpx.HTTPError, AnypointLogError, ValueError, KeyError):
+            return configured  # network/parse trouble: fall back to the pinned URL
+        return f"{base}/specs/{version}/{tail}" if version else configured
+
+    def _current_version(self, client: httpx.Client, deployment_url: str) -> str | None:
+        """The deployment's currently-running spec version (``desiredVersion``)."""
+        token = self._auth.get_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        response = client.get(deployment_url, headers=headers)
+        if response.status_code != 200:
+            raise AnypointLogError(f"deployment lookup returned HTTP {response.status_code}")
+        data = response.json()
+        return data.get("desiredVersion") or data.get("lastSuccessfulVersion")
 
     def _get_with_retry(self, client: httpx.Client, url: str) -> httpx.Response:
         last_status: int | None = None

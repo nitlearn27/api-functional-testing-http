@@ -137,3 +137,45 @@ class SuiteReport(BaseModel):
     failed: int = 0
     cases: list[CaseReport] = Field(default_factory=list)
     parse_errors: list[ParseError] = Field(default_factory=list)
+
+
+# --- Per-case evidence (run_and_record evidence tabs) ----------------------------------
+
+
+class CaseEvidence(BaseModel):
+    """Full evidence for one case in one run, written into that case's own sheet tab.
+
+    Internal to the record path (``run_and_record`` -> ``write_evidence_tabs``); it is not
+    returned across the MCP boundary. Carries the raw request/response and the actual log lines
+    that decided each expected-string match, so the tab is a self-contained record of the run.
+    """
+
+    test_id: str
+    description: str | None = None
+    passed: bool
+    error: str | None = None
+    # request
+    method: str | None = None
+    url: str | None = None
+    request_headers: dict[str, Any] = Field(default_factory=dict)
+    request_body: Any = None
+    # response validation
+    actual_status: int | None = None
+    expected_status: int | None = None
+    latency_ms: float | None = None
+    match_mode: MatchMode | None = None
+    response_passed: bool | None = None
+    response_diffs: list[ResponseDiff] = Field(default_factory=list)
+    actual_body: Any = None
+    # log validation
+    validated_logs: bool = False
+    logs_passed: bool | None = None
+    log_source: str | None = None
+    correlation_id: str | None = None
+    expected_log_strings: list[str] = Field(default_factory=list)
+    matched_logs: list[str] = Field(default_factory=list)
+    missing_logs: list[str] = Field(default_factory=list)
+    used_fallback: bool = False
+    lines_considered: int = 0
+    # expected string -> the actual log lines that matched it (empty list = no match)
+    matched_log_lines: dict[str, list[str]] = Field(default_factory=dict)

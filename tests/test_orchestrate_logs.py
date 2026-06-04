@@ -24,9 +24,13 @@ def _make_suite(path, rows) -> None:
     wb.save(path)
 
 
-def test_log_phase_one_snapshot_and_merge(tmp_path, sample_log_path, monkeypatch):
-    # Two cases, both validate_logs=Yes against the file source: one expects a string present
-    # in the sample log, the other expects a missing one.
+class _FixedUUID:
+    hex = "abcdef012345deadbeefcafe00000000"  # [:12] -> "abcdef012345"
+
+
+def test_log_phase_one_snapshot_and_merge(tmp_path, monkeypatch):
+    # Two cases, both validate_logs=Yes against the file source: one expects a string that
+    # appears on a line carrying its correlation id, the other expects a missing one.
     rows = [
         ["TC-1", "POST", "/orders", "no", 201, "yes",
          '["Order lookup succeeded"]', "contains", "file"],
@@ -36,14 +40,25 @@ def test_log_phase_one_snapshot_and_merge(tmp_path, sample_log_path, monkeypatch
     suite_path = tmp_path / "suite.xlsx"
     _make_suite(suite_path, rows)
 
-    # Mock the HTTP call so the response assertion passes without network.
+    # Deterministic correlation ids so the log file can carry them: TC-1-abcdef012345, etc.
+    monkeypatch.setattr(orchestrate.uuid, "uuid4", lambda: _FixedUUID())
+
+    # A log where the expected message appears on the TC-1 correlation line AND, separately, on
+    # an UNRELATED correlation line. The strict rule must record only the former (corr id +
+    # message both present), never the message-only line.
+    log = tmp_path / "app.log"
+    log.write_text(
+        "2026-06-04T10:00:01Z INFO event:TC-1-abcdef012345 - Order lookup succeeded\n"
+        "2026-06-04T10:00:02Z INFO event:OTHER-999 - Order lookup succeeded\n"
+    )
+
     monkeypatch.setattr(orchestrate, "call_api",
                         lambda *a, **k: ApiResponse(status=201, body=None))
-
-    # Settings: file backend pointed at the sample log; no propagation wait in tests.
     monkeypatch.setattr(
         orchestrate, "get_settings",
-        lambda: Settings(file_log_path=sample_log_path, propagation_wait_seconds=0),
+        # No waits/retries in the test (TC-2's logs are intentionally absent).
+        lambda: Settings(file_log_path=str(log), propagation_wait_seconds=0,
+                         log_fetch_max_retries=0),
     )
 
     # Count how many times a snapshot is taken.
@@ -65,14 +80,56 @@ def test_log_phase_one_snapshot_and_merge(tmp_path, sample_log_path, monkeypatch
     assert tc1.log_validation is not None
     assert tc1.log_validation.passed
     assert tc1.passed
-    # correlation id (generated) won't be in the sample log -> whole-log fallback
-    assert tc1.log_validation.used_fallback
+    assert not tc1.log_validation.used_fallback  # matched on the correlation line, not whole-log
+    # only the line carrying TC-1's correlation id is considered (the OTHER-999 line is excluded)
+    assert tc1.log_validation.lines_considered == 1
 
     tc2 = by_id["TC-2"]
     assert tc2.log_validation is not None
     assert not tc2.log_validation.passed
     assert not tc2.passed
     assert tc2.log_validation.missing == ["string that is not in the log"]
+
+
+def test_snapshot_retries_until_correlation_present(monkeypatch):
+    """Re-fetch on an interval until the correlation id surfaces, discarding stale snapshots."""
+    sids = iter(["s0", "s1", "s2"])
+    fetched: list[str] = []
+    monkeypatch.setattr(orchestrate, "snapshot_logs",
+                        lambda *a, **k: fetched.append(n := next(sids)) or n)
+    present = {"s0": False, "s1": True, "s2": True}
+    monkeypatch.setattr(orchestrate, "correlation_present", lambda sid, cid: present[sid])
+    discarded: list[str] = []
+    monkeypatch.setattr(orchestrate, "discard_snapshot", lambda sid: discarded.append(sid))
+    slept: list[float] = []
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda s: slept.append(s))
+
+    settings = Settings(log_fetch_max_retries=3, log_fetch_retry_wait_seconds=60)
+    sid = orchestrate._snapshot_with_retry(settings, "anypoint", ["TC-1-x"])
+
+    assert sid == "s1"            # stopped as soon as the id appeared
+    assert fetched == ["s0", "s1"]
+    assert discarded == ["s0"]   # the stale first snapshot was dropped
+    assert slept == [60]         # one 60s wait before the retry
+
+
+def test_snapshot_retry_gives_up_after_max(monkeypatch):
+    """After the retry budget is exhausted, return the freshest snapshot anyway."""
+    sids = iter(["s0", "s1", "s2"])
+    fetched: list[str] = []
+    monkeypatch.setattr(orchestrate, "snapshot_logs",
+                        lambda *a, **k: fetched.append(n := next(sids)) or n)
+    monkeypatch.setattr(orchestrate, "correlation_present", lambda sid, cid: False)
+    monkeypatch.setattr(orchestrate, "discard_snapshot", lambda sid: None)
+    slept: list[float] = []
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda s: slept.append(s))
+
+    settings = Settings(log_fetch_max_retries=2, log_fetch_retry_wait_seconds=60)
+    sid = orchestrate._snapshot_with_retry(settings, "anypoint", ["TC-1-x"])
+
+    assert sid == "s2"               # 1 initial + 2 retries
+    assert fetched == ["s0", "s1", "s2"]
+    assert slept == [60, 60]
 
 
 def test_no_log_phase_when_all_disabled(tmp_path, monkeypatch):

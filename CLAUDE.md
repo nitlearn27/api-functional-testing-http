@@ -69,7 +69,8 @@ when a case sets `auth_required=yes`.
 ## Config / .env
 
 - Main settings use the `ALT_` env prefix (e.g. `ALT_FILE_LOG_PATH`,
-  `ALT_PROPAGATION_WAIT_SECONDS`, `ALT_LOG_CORRELATION_FALLBACK`).
+  `ALT_PROPAGATION_WAIT_SECONDS` (default 60), `ALT_LOG_FETCH_MAX_RETRIES` (default 3),
+  `ALT_LOG_FETCH_RETRY_WAIT_SECONDS` (default 60), `ALT_LOG_CORRELATION_FALLBACK`).
 - **Anypoint** credentials/URL are read from `.env` with plain lowercase keys (no prefix):
   `application_logs_fetch_url`, `token_endpoint`, `client_id`, `client_secret`, `grant_type`.
   The loader accepts both `=` and `:` separators. `.env` is gitignored — never commit secrets,

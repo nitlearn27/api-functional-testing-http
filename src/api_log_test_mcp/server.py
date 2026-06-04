@@ -1,7 +1,7 @@
 """FastMCP server entry point.
 
-Registers all seven tools so the contract is fixed early. Four are implemented (the
-no-network core); three raise NotImplementedError until their phase lands.
+Registers all eight tools so the contract is fixed early. The no-network core plus the
+end-to-end runners are implemented; ``get_auth_token`` stays a stub until its phase lands.
 """
 
 from __future__ import annotations
@@ -109,6 +109,18 @@ def call_api(
 def run_suite(suite_path: str, retain_snapshots: bool = False) -> SuiteReport:
     """Run a full suite end-to-end (call + assert + optional log validation) and emit a report."""
     return _orchestrate.run_suite(suite_path, retain_snapshots)
+
+
+@mcp.tool
+def run_and_record(suite_path: str, retain_snapshots: bool = False) -> dict[str, Any]:
+    """Run a suite end-to-end AND append a timestamped results block to the sheet.
+
+    Prefer this over ``run_suite`` to actually test end-to-end: it makes real HTTP calls,
+    optionally validates logs, and records the outcome back into the suite sheet. Returns the
+    aggregate ``report`` plus the ``run_at`` timestamp of the recorded block.
+    """
+    report, run_at = _orchestrate.run_and_record(suite_path, retain_snapshots)
+    return {"run_at": run_at, "report": report}
 
 
 def main() -> None:

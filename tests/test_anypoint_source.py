@@ -81,6 +81,55 @@ def test_snapshot_retries_on_429_then_succeeds():
     assert snap.total_lines() == 3
 
 
+def test_log_url_resolves_to_live_deployment_version():
+    """A pinned spec URL is rebuilt with the deployment's current desiredVersion before fetch."""
+    dep = "https://anypoint.test/amc/.../deployments/dep-1"
+    pinned = f"{dep}/specs/OLD-spec/logs/file"
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        if url == dep:  # deployment lookup -> the live spec version
+            return httpx.Response(200, json={"desiredVersion": "NEW-spec",
+                                             "lastSuccessfulVersion": "NEW-spec"})
+        seen["log_url"] = url
+        return httpx.Response(200, text=SAMPLE_LOG)
+
+    settings = AnypointSettings(token_endpoint=TOKEN_URL, application_logs_fetch_url=pinned,
+                                client_id="cid", client_secret="secret")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = AnypointLogSource(settings, client=client, sleep=lambda _s: None)
+
+    source.snapshot()
+    assert seen["log_url"] == f"{dep}/specs/NEW-spec/logs/file"  # fetched the live spec, not OLD
+
+
+def test_log_url_falls_back_when_deployment_lookup_fails():
+    """If the deployment lookup errors, fetch the configured (pinned) URL unchanged."""
+    dep = "https://anypoint.test/amc/.../deployments/dep-1"
+    pinned = f"{dep}/specs/OLD-spec/logs/file"
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        if url == dep:
+            return httpx.Response(500, text="boom")  # lookup fails
+        seen["log_url"] = url
+        return httpx.Response(200, text=SAMPLE_LOG)
+
+    settings = AnypointSettings(token_endpoint=TOKEN_URL, application_logs_fetch_url=pinned,
+                                client_id="cid", client_secret="secret")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = AnypointLogSource(settings, client=client, sleep=lambda _s: None)
+
+    source.snapshot()
+    assert seen["log_url"] == pinned  # fell back to the configured URL
+
+
 def test_snapshot_raises_on_non_retryable_status():
     source = _source(_token_or(lambda req: httpx.Response(404, text="not found")))
     with pytest.raises(AnypointLogError):

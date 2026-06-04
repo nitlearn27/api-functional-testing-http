@@ -55,9 +55,15 @@ class Settings(BaseSettings):
     oauth_scopes: str | None = None
 
     # --- Behaviour defaults ---
-    propagation_wait_seconds: float = 10.0
+    # CloudHub takes ~a minute to surface a request's logs, so wait before the first fetch.
+    propagation_wait_seconds: float = 60.0
+    # If a case's correlation-id logs aren't in the snapshot yet, re-download up to
+    # ``log_fetch_max_retries`` more times, waiting ``log_fetch_retry_wait_seconds`` between.
+    log_fetch_max_retries: int = 3
+    log_fetch_retry_wait_seconds: float = 60.0
     # When True, log validation falls back to the whole snapshot if no lines match the
     # request's correlation id. When False, only correlation-matched lines are considered.
+    # (The orchestrated run path forces strict correlation scoping regardless of this flag.)
     log_correlation_fallback: bool = True
 
 

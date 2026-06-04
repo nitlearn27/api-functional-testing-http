@@ -12,6 +12,7 @@ EXPECTED_TOOLS = {
     "get_auth_token",
     "call_api",
     "run_suite",
+    "run_and_record",
 }
 
 

@@ -18,15 +18,33 @@ notes and gotchas.
 | `snapshot_logs` | ✅ download logs once (file mock **or** Anypoint/CloudHub) |
 | `validate_logs` | ✅ check `expected_log_strings`, correlation-scoped with whole-log fallback |
 | `run_suite` | ✅ batched: call + assert → one log snapshot per run → validate → report |
+| `run_and_record` | ✅ end-to-end: `run_suite` **+** append a timestamped results block to the sheet |
 | `get_auth_token` | 🚧 stub — only needed when a case sets `auth_required=yes` |
+
+## Prerequisites
+
+- **Python ≥ 3.11**
+- **[uv](https://docs.astral.sh/uv/)** — the package manager this project uses. It installs to
+  `~/.local/bin`:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  ```
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** (only needed to register
+  this as an MCP server — see below).
 
 ## Quick start
 
 ```bash
-uv sync --all-extras --dev      # create env + install deps
+git clone https://github.com/nitesh22778844/api-functional-testing.git
+cd api-functional-testing
+
+uv sync --all-extras --dev      # create env + install deps from uv.lock
 uv run ruff check .             # lint
 uv run pytest -q                # tests (all offline; network mocked)
 ```
+
+If the tests pass, the server is healthy and ready to register.
 
 ### Run a suite (live)
 
@@ -47,7 +65,12 @@ Runs over **stdio**. Register it with your MCP client using an absolute `uv` pat
 ```bash
 claude mcp add api-log-test -- ~/.local/bin/uv run \
   --directory /abs/path/to/api-functional-testing api-log-test-mcp
+
+claude mcp list   # verify it shows api-log-test as connected
 ```
+
+> Use the **absolute** path to `uv` and `--directory` — the MCP client launches the process
+> without your shell's `PATH` or working directory, so relative paths often fail.
 
 **Claude Desktop / any client (`mcpServers` JSON):**
 ```json
@@ -68,12 +91,22 @@ Inspect tools locally with: `uv run fastmcp dev src/api_log_test_mcp/server.py`.
 Copy [`.env.example`](.env.example) to `.env` and fill in your own values. `.env` is gitignored —
 never commit secrets.
 
+```bash
+cp .env.example .env   # then edit .env with your values
+```
+
+> Only required for `validate_logs=Yes` cases. Pure HTTP-assertion suites run without an `.env`.
+
 - **Anypoint / CloudHub** (required only for `validate_logs=Yes` cases) — plain lowercase keys
   (no prefix): `application_logs_fetch_url`, `token_endpoint`, `client_id`, `client_secret`,
   `grant_type`. Token is acquired via OAuth2 **client-credentials**. The loader accepts both
   `=` and `:` separators.
 - **Behaviour** (`ALT_` prefix): `ALT_FILE_LOG_PATH` (mock file log backend),
-  `ALT_PROPAGATION_WAIT_SECONDS` (default 10), `ALT_LOG_CORRELATION_FALLBACK` (default true).
+  `ALT_PROPAGATION_WAIT_SECONDS` (wait before the first log fetch, default 60),
+  `ALT_LOG_FETCH_MAX_RETRIES` (re-fetch until each correlation id's logs appear, default 3),
+  `ALT_LOG_FETCH_RETRY_WAIT_SECONDS` (wait between retries, default 60),
+  `ALT_LOG_CORRELATION_FALLBACK` (default true; the orchestrated run forces strict
+  correlation scoping regardless).
 
 > Note: the CloudHub log URL is fixed in `.env` for now; building it dynamically from
 > application id + version is isolated in `AnypointLogSource._log_url()` for later.

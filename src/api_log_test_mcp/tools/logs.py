@@ -91,16 +91,52 @@ def validate_logs(
     )
 
 
+def matched_log_lines(
+    snapshot_id: str,
+    correlation_id: str,
+    expected: list[str],
+    mode: LogMatchMode = LogMatchMode.CONTAINS,
+    *,
+    correlation_fallback: bool = True,
+    store: SnapshotStore | None = None,
+) -> dict[str, list[str]]:
+    """For each expected string, the snapshot lines it matches (as log evidence).
+
+    Uses the same correlation-id scoping (and whole-log fallback) as :func:`validate_logs`, so
+    the lines returned here are exactly the ones that decided the pass/fail. Each value is the
+    full list of matching lines; an expected string with no match maps to an empty list.
+    """
+    store = store or _STORE
+    snap = store.get(snapshot_id)
+    lines = snap.lines_for(correlation_id)
+    if not lines and correlation_fallback:
+        lines = snap.all_lines()
+    return {needle: _matching_lines(needle, lines, mode) for needle in expected}
+
+
+def correlation_present(
+    snapshot_id: str, correlation_id: str, *, store: SnapshotStore | None = None
+) -> bool:
+    """Whether the snapshot has any line carrying ``correlation_id`` (gates fetch retries)."""
+    store = store or _STORE
+    return bool(store.get(snapshot_id).lines_for(correlation_id))
+
+
 def discard_snapshot(snapshot_id: str, *, store: SnapshotStore | None = None) -> bool:
     """Drop a snapshot from memory."""
     store = store or _STORE
     return store.discard(snapshot_id)
 
 
-def _matches(needle: str, lines: list[str], mode: LogMatchMode) -> bool:
-    """Does ``needle`` appear in any line? regex mode treats it as a pattern."""
+def _matching_lines(needle: str, lines: list[str], mode: LogMatchMode) -> list[str]:
+    """Every line ``needle`` matches. regex mode treats it as a pattern; others are substring."""
     if mode is LogMatchMode.REGEX:
         pattern = re.compile(needle)
-        return any(pattern.search(line) for line in lines)
+        return [line for line in lines if pattern.search(line)]
     # contains / all_of / any_of all use plain substring matching per string.
-    return any(needle in line for line in lines)
+    return [line for line in lines if needle in line]
+
+
+def _matches(needle: str, lines: list[str], mode: LogMatchMode) -> bool:
+    """Does ``needle`` appear in any line? regex mode treats it as a pattern."""
+    return bool(_matching_lines(needle, lines, mode))

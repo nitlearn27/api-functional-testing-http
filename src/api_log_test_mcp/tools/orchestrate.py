@@ -20,12 +20,18 @@ from dataclasses import dataclass
 from urllib.parse import urljoin
 
 from ..config import Settings, get_settings
-from ..models import CaseReport, SuiteReport, TestCase
+from ..models import ApiResponse, CaseEvidence, CaseReport, SuiteReport, TestCase
 from .auth import get_auth_token
 from .http_runner import ApiCallError, call_api
-from .logs import discard_snapshot, snapshot_logs, validate_logs
+from .logs import (
+    correlation_present,
+    discard_snapshot,
+    matched_log_lines,
+    snapshot_logs,
+    validate_logs,
+)
 from .response import assert_case_response
-from .results_writer import write_results
+from .results_writer import write_evidence_tabs, write_results
 from .suite import read_test_suite
 
 
@@ -36,10 +42,32 @@ class _CaseRun:
     case: TestCase
     report: CaseReport
     correlation_id: str | None
+    sent_request: dict | None = None
+    response: ApiResponse | None = None
+    matched_log_lines: dict[str, list[str]] | None = None
 
 
 def run_suite(suite_path: str, retain_snapshots: bool = False) -> SuiteReport:
     """Run every case in the suite at ``suite_path`` and return an aggregate report."""
+    report, _evidence = _run(suite_path, retain_snapshots)
+    return report
+
+
+def run_and_record(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, str]:
+    """Run the suite, append a timestamped results block, and write per-case evidence tabs.
+
+    Use this (rather than bare ``run_suite``) so every test run is recorded into the sheet:
+    the stacked ``RESULTS`` summary block (appended) plus one overwrite-in-place evidence tab
+    per case (latest run only).
+    """
+    report, evidence = _run(suite_path, retain_snapshots)
+    run_at = write_results(suite_path, report)
+    write_evidence_tabs(suite_path, evidence, run_at)
+    return report, run_at
+
+
+def _run(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, list[CaseEvidence]]:
+    """Run every case and return both the aggregate report and per-case evidence."""
     suite = read_test_suite(suite_path)
     settings = get_settings()
     report = SuiteReport(parse_errors=suite.parse_errors)
@@ -60,17 +88,41 @@ def run_suite(suite_path: str, retain_snapshots: bool = False) -> SuiteReport:
     report.total = len(report.cases)
     report.passed = sum(1 for c in report.cases if c.passed)
     report.failed = report.total - report.passed
-    return report
+    return report, [_build_evidence(r) for r in runs]
 
 
-def run_and_record(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, str]:
-    """Run the suite and append a timestamped results block to the sheet.
-
-    Use this (rather than bare ``run_suite``) so every test run is recorded into the sheet.
-    """
-    report = run_suite(suite_path, retain_snapshots)
-    run_at = write_results(suite_path, report)
-    return report, run_at
+def _build_evidence(run: _CaseRun) -> CaseEvidence:
+    """Flatten a finished ``_CaseRun`` into the self-contained evidence record for its tab."""
+    case, rep = run.case, run.report
+    ra, lv, resp = rep.response_assert, rep.log_validation, run.response
+    req = run.sent_request or {}
+    return CaseEvidence(
+        test_id=case.test_id,
+        description=case.description,
+        passed=rep.passed,
+        error=rep.error,
+        method=req.get("method"),
+        url=req.get("url"),
+        request_headers=req.get("headers") or {},
+        request_body=req.get("body"),
+        actual_status=rep.actual_status,
+        expected_status=rep.expected_status,
+        latency_ms=resp.latency_ms if resp else None,
+        match_mode=ra.mode if ra else None,
+        response_passed=ra.passed if ra else None,
+        response_diffs=ra.diffs if ra else [],
+        actual_body=resp.body if resp else None,
+        validated_logs=case.validate_logs,
+        logs_passed=lv.passed if lv else None,
+        log_source=case.log_source if case.validate_logs else None,
+        correlation_id=rep.correlation_id,
+        expected_log_strings=case.expected_log_strings,
+        matched_logs=lv.matched if lv else [],
+        missing_logs=lv.missing if lv else [],
+        used_fallback=lv.used_fallback if lv else False,
+        lines_considered=lv.lines_considered if lv else 0,
+        matched_log_lines=run.matched_log_lines or {},
+    )
 
 
 def _run_request(case: TestCase, base_path: str | None) -> _CaseRun:
@@ -84,6 +136,7 @@ def _run_request(case: TestCase, base_path: str | None) -> _CaseRun:
         if case.auth_required:
             headers["Authorization"] = f"Bearer {get_auth_token()}"
 
+        sent_request = {"method": case.method, "url": url, "headers": headers, "body": case.body}
         response = call_api(
             case.method, url, headers=headers, body=case.body, correlation_id=correlation_id,
         )
@@ -96,7 +149,8 @@ def _run_request(case: TestCase, base_path: str | None) -> _CaseRun:
             expected_status=case.expected_status,
             response_assert=response_assert,
         )
-        return _CaseRun(case=case, report=report, correlation_id=correlation_id)
+        return _CaseRun(case=case, report=report, correlation_id=correlation_id,
+                        sent_request=sent_request, response=response)
     except ApiCallError as exc:
         return _failed_run(case, correlation_id, f"request failed: {exc}")
     except NotImplementedError as exc:
@@ -119,6 +173,7 @@ def _validate_logs_phase(
     if not log_runs:
         return
 
+    # CloudHub needs time to surface a request's logs, so wait before the first fetch.
     if settings.propagation_wait_seconds > 0:
         time.sleep(settings.propagation_wait_seconds)
 
@@ -128,8 +183,9 @@ def _validate_logs_phase(
         by_source.setdefault(r.case.log_source, []).append(r)
 
     for source_name, group in by_source.items():
+        correlation_ids = [r.correlation_id for r in group if r.correlation_id]
         try:
-            sid = snapshot_logs(settings, log_source=source_name)
+            sid = _snapshot_with_retry(settings, source_name, correlation_ids)
             active_snapshots.append(sid)
         except Exception as exc:  # noqa: BLE001 - attribute the failure to every case in group
             for r in group:
@@ -138,10 +194,40 @@ def _validate_logs_phase(
             continue
 
         for r in group:
+            # A log line counts only if it carries this case's correlation id AND the expected
+            # message — never a whole-log message-only match against unrelated runs. So both
+            # validation and evidence are strictly correlation-scoped (no fallback).
             lv = validate_logs(
                 sid, r.correlation_id, r.case.expected_log_strings, r.case.log_match_mode,
-                correlation_fallback=settings.log_correlation_fallback,
+                correlation_fallback=False,
             )
             r.report.log_validation = lv
             if not lv.passed:
                 r.report.passed = False
+            # Capture the actual matching lines as evidence (blank if none carry the corr id).
+            r.matched_log_lines = matched_log_lines(
+                sid, r.correlation_id, r.case.expected_log_strings, r.case.log_match_mode,
+                correlation_fallback=False,
+            )
+
+
+def _snapshot_with_retry(
+    settings: Settings, source_name: str, correlation_ids: list[str]
+) -> str:
+    """Download a log snapshot, retrying until every correlation id's logs have surfaced.
+
+    CloudHub publishes a request's logs with a lag, so after the initial fetch we re-download
+    up to ``log_fetch_max_retries`` more times (waiting ``log_fetch_retry_wait_seconds`` between
+    tries) until each case's correlation id appears. Intermediate snapshots are discarded. The
+    most recent snapshot id is returned even if some ids never showed up (those cases then fail
+    honestly rather than blocking forever).
+    """
+    sid = snapshot_logs(settings, log_source=source_name)
+    for _ in range(max(0, settings.log_fetch_max_retries)):
+        if all(correlation_present(sid, cid) for cid in correlation_ids):
+            break
+        if settings.log_fetch_retry_wait_seconds > 0:
+            time.sleep(settings.log_fetch_retry_wait_seconds)
+        discard_snapshot(sid)
+        sid = snapshot_logs(settings, log_source=source_name)
+    return sid

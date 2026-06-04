@@ -6,7 +6,9 @@ lives only until ``discard`` (or process exit).
 
 The correlation ID is extracted from each line with a configurable regex. The default
 matches common Mule/MDC forms: ``correlationId: <id>``, ``correlationId=<id>``,
-``[correlationId: <id>]`` (case-insensitive, optional quotes).
+``[correlationId: <id>]`` (case-insensitive, optional quotes), and the Mule runtime's
+per-event log prefix ``event:<id>`` — CloudHub stamps the inbound ``X-Correlation-ID`` as the
+flow's event id, so ``event:<id>`` is where the correlation id actually surfaces in app logs.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from dataclasses import dataclass, field
 from ..logsource.base import LogSource, RawSnapshot
 
 DEFAULT_CORRELATION_PATTERN = re.compile(
-    r"""correlation[_-]?id["']?\s*[:=]\s*["']?([A-Za-z0-9._-]+)""",
+    r"""(?:correlation[_-]?id["']?\s*[:=]\s*["']?|event:)([A-Za-z0-9._-]+)""",
     re.IGNORECASE,
 )
 

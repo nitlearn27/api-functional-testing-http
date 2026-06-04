@@ -4,11 +4,12 @@ Implements ``snapshot()`` against the CloudHub 2.0 log-file endpoint configured 
 (``application_logs_fetch_url``). One download per run (the snapshot store reuses it across all
 cases), with a small bounded backoff on transient 429/500 responses.
 
-The configured URL is a ``.../deployments/{id}/specs/{version}/logs/file`` template. The spec
-``{version}`` changes on **every redeploy** (a new spec + new replicas), so a pinned version
-silently serves the old, shut-down replica's logs. ``_log_url()`` therefore resolves the
-deployment's *current* version at fetch time and rebuilds the URL, falling back to the
-configured URL as-is if the shape is unexpected or resolution fails.
+The configured URL is the deployment base ``.../deployments/{id}``. The spec ``{version}``
+changes on **every redeploy** (a new spec + new replicas), so a pinned version would silently
+serve the old, shut-down replica's logs. ``_log_url()`` therefore resolves the deployment's
+*current* version at fetch time and builds ``.../specs/{version}/logs/file`` from it. (A URL
+that still pins a ``/specs/...`` segment is accepted — everything from ``/specs/`` on is
+replaced.) There is no pinned version to fall back to, so a failed resolution raises.
 """
 
 from __future__ import annotations
@@ -67,23 +68,25 @@ class AnypointLogSource(LogSource):
         return RawSnapshot(lines_by_instance={_INSTANCE: lines})
 
     def _log_url(self, client: httpx.Client) -> str | None:
-        """Resolve the log-file URL, swapping the pinned spec for the deployment's live version.
+        """Build the log-file URL from the deployment base + the deployment's live spec version.
 
-        Reads ``desiredVersion`` (the running spec) from the deployment and rebuilds
-        ``.../deployments/{id}/specs/{liveVersion}/logs/file``. If the configured URL is not in
-        that shape, or the lookup fails, the configured URL is returned unchanged.
+        Reads ``desiredVersion`` (the running spec) from the deployment and builds
+        ``.../deployments/{id}/specs/{liveVersion}/logs/file``. The configured URL is the
+        deployment base; a URL that still pins a ``/specs/...`` segment is accepted too —
+        everything from ``/specs/`` on is replaced. Returns ``None`` only when nothing is
+        configured, and raises if the live version cannot be resolved (no pinned fallback).
         """
         configured = self._settings.application_logs_fetch_url
-        if not configured or "/specs/" not in configured:
-            return configured
+        if not configured:
+            return None
 
-        base, spec_tail = configured.split("/specs/", 1)  # base=.../deployments/{id}
-        tail = spec_tail.split("/", 1)[1] if "/" in spec_tail else "logs/file"  # "logs/file"
-        try:
-            version = self._current_version(client, base)
-        except (httpx.HTTPError, AnypointLogError, ValueError, KeyError):
-            return configured  # network/parse trouble: fall back to the pinned URL
-        return f"{base}/specs/{version}/{tail}" if version else configured
+        base = configured.split("/specs/", 1)[0].rstrip("/")  # base=.../deployments/{id}
+        version = self._current_version(client, base)
+        if not version:
+            raise AnypointLogError(
+                f"could not resolve the deployment's current spec version from {base}"
+            )
+        return f"{base}/specs/{version}/logs/file"
 
     def _current_version(self, client: httpx.Client, deployment_url: str) -> str | None:
         """The deployment's currently-running spec version (``desiredVersion``)."""

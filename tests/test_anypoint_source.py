@@ -8,7 +8,8 @@ from api_log_test_mcp.config import AnypointSettings
 from api_log_test_mcp.logsource.anypoint_source import AnypointLogError, AnypointLogSource
 
 TOKEN_URL = "https://anypoint.test/accounts/api/v2/oauth2/token"
-LOG_URL = "https://anypoint.test/amc/.../logs/file"
+DEPLOYMENT_URL = "https://anypoint.test/amc/.../deployments/dep-1"
+LIVE_VERSION = "spec-live"
 
 SAMPLE_LOG = (
     "2026-06-04 10:00:01 INFO Order intake started [correlationId: TC-001-abc]\n"
@@ -19,7 +20,7 @@ SAMPLE_LOG = (
 
 def _settings() -> AnypointSettings:
     return AnypointSettings(
-        token_endpoint=TOKEN_URL, application_logs_fetch_url=LOG_URL,
+        token_endpoint=TOKEN_URL, application_logs_fetch_url=DEPLOYMENT_URL,
         client_id="cid", client_secret="secret",
     )
 
@@ -30,9 +31,13 @@ def _source(handler) -> AnypointLogSource:
 
 
 def _token_or(log_response):
+    """Handle the token + deployment-version lookups; delegate the log fetch to log_response."""
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == TOKEN_URL:
+        url = str(request.url)
+        if url == TOKEN_URL:
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        if url == DEPLOYMENT_URL:
+            return httpx.Response(200, json={"desiredVersion": LIVE_VERSION})
         return log_response(request)
     return handler
 
@@ -106,11 +111,32 @@ def test_log_url_resolves_to_live_deployment_version():
     assert seen["log_url"] == f"{dep}/specs/NEW-spec/logs/file"  # fetched the live spec, not OLD
 
 
-def test_log_url_falls_back_when_deployment_lookup_fails():
-    """If the deployment lookup errors, fetch the configured (pinned) URL unchanged."""
+def test_log_url_builds_from_deployment_base():
+    """A bare deployment-base URL gets /specs/{desiredVersion}/logs/file appended."""
     dep = "https://anypoint.test/amc/.../deployments/dep-1"
-    pinned = f"{dep}/specs/OLD-spec/logs/file"
     seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        if url == dep:  # deployment lookup -> the live spec version
+            return httpx.Response(200, json={"desiredVersion": "NEW-spec"})
+        seen["log_url"] = url
+        return httpx.Response(200, text=SAMPLE_LOG)
+
+    settings = AnypointSettings(token_endpoint=TOKEN_URL, application_logs_fetch_url=dep,
+                                client_id="cid", client_secret="secret")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = AnypointLogSource(settings, client=client, sleep=lambda _s: None)
+
+    source.snapshot()
+    assert seen["log_url"] == f"{dep}/specs/NEW-spec/logs/file"
+
+
+def test_log_url_raises_when_deployment_lookup_fails():
+    """With no pinned spec to fall back to, a failed deployment lookup raises (fail loud)."""
+    dep = "https://anypoint.test/amc/.../deployments/dep-1"
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -118,16 +144,15 @@ def test_log_url_falls_back_when_deployment_lookup_fails():
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
         if url == dep:
             return httpx.Response(500, text="boom")  # lookup fails
-        seen["log_url"] = url
         return httpx.Response(200, text=SAMPLE_LOG)
 
-    settings = AnypointSettings(token_endpoint=TOKEN_URL, application_logs_fetch_url=pinned,
+    settings = AnypointSettings(token_endpoint=TOKEN_URL, application_logs_fetch_url=dep,
                                 client_id="cid", client_secret="secret")
     client = httpx.Client(transport=httpx.MockTransport(handler))
     source = AnypointLogSource(settings, client=client, sleep=lambda _s: None)
 
-    source.snapshot()
-    assert seen["log_url"] == pinned  # fell back to the configured URL
+    with pytest.raises(AnypointLogError):
+        source.snapshot()
 
 
 def test_snapshot_raises_on_non_retryable_status():

@@ -17,7 +17,6 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from urllib.parse import urljoin
 
 from ..config import Settings, get_settings
 from ..models import ApiResponse, CaseEvidence, CaseReport, SuiteReport, TestCase
@@ -111,6 +110,7 @@ def _build_evidence(run: _CaseRun) -> CaseEvidence:
         match_mode=ra.mode if ra else None,
         response_passed=ra.passed if ra else None,
         response_diffs=ra.diffs if ra else [],
+        expected_response=case.expected_response,
         actual_body=resp.body if resp else None,
         validated_logs=case.validate_logs,
         logs_passed=lv.passed if lv else None,
@@ -125,12 +125,24 @@ def _build_evidence(run: _CaseRun) -> CaseEvidence:
     )
 
 
+def _join_url(base_path: str | None, url: str) -> str:
+    """Join a suite base path with a case url, preserving the base subpath.
+
+    ``urljoin`` discards the base subpath when ``url`` starts with ``/`` (it treats it as
+    host-absolute), so ``.../api`` + ``/products`` would wrongly become ``.../products``.
+    A fully-qualified case url (``http(s)://...``) is used as-is.
+    """
+    if url.startswith(("http://", "https://")) or not base_path:
+        return url
+    return f"{base_path.rstrip('/')}/{url.lstrip('/')}"
+
+
 def _run_request(case: TestCase, base_path: str | None) -> _CaseRun:
     """Do the call + response assertion for one case (no log validation yet)."""
     # Generate the correlation id up front so it is recorded even if the request fails.
     correlation_id = f"{case.test_id}-{uuid.uuid4().hex[:12]}"
     try:
-        url = urljoin(base_path or "", case.url) if base_path else case.url
+        url = _join_url(base_path, case.url)
 
         headers = dict(case.headers)
         if case.auth_required:

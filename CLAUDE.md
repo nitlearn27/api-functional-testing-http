@@ -20,7 +20,7 @@ export PATH="$HOME/.local/bin:$PATH"
 uv sync --all-extras --dev      # install
 uv run ruff check .             # lint
 uv run pytest -q                # tests (all offline; network is mocked)
-uv run fastmcp dev src/api_log_test_mcp/server.py   # MCP Inspector
+uv run fastmcp dev inspector -m api_log_test_mcp.server:mcp   # MCP Inspector (FastMCP 3.x; -m required)
 ```
 
 ## Run a suite (live)

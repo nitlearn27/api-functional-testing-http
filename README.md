@@ -12,6 +12,7 @@ notes and gotchas.
 
 | Tool | Status |
 |------|--------|
+| `generate_test_suite` | ✅ build a runnable `.xlsx` suite from an OpenAPI YAML spec |
 | `read_test_suite` | ✅ parse a `.numbers`/`.xlsx` suite into structured cases |
 | `assert_response` | ✅ `exact` / `json_subset` / `schema` / `status_only` (+ `ignore_paths`, `<<any>>`) |
 | `call_api` | ✅ httpx runner, column-driven, stamps `X-Correlation-ID` |
@@ -46,15 +47,27 @@ uv run pytest -q                # tests (all offline; network mocked)
 
 If the tests pass, the server is healthy and ready to register.
 
+### Generate a suite from an OpenAPI spec
+
+```python
+from api_log_test_mcp.tools.suite_generator import generate_test_suite
+generate_test_suite("resources/products-eapi1.yaml")   # -> resources/products-eapi1_suite.xlsx
+```
+
+Builds a comprehensive `.xlsx` suite (a positive case per operation plus one negative per
+validation rule) in the exact format the parser/runner consume. Edit the generated sheet to
+taste, then run it.
+
 ### Run a suite (live)
 
 ```python
 from api_log_test_mcp.tools.orchestrate import run_and_record
-report, run_at = run_and_record("api_test_suite_sample.numbers")
+report, run_at = run_and_record("resources/products-eapi1_suite.xlsx")
 ```
 
 Use `run_and_record` (not bare `run_suite`) — it runs **and** appends a timestamped results
-block into the sheet. ⚠️ This makes **real HTTP calls** and writes back to the sheet.
+block into the sheet (plus a per-case evidence tab). ⚠️ This makes **real HTTP calls** and writes
+back to the sheet; cases with `validate_logs=yes` also fetch CloudHub logs (needs `.env`).
 
 ## Use as an MCP server
 
@@ -84,7 +97,15 @@ claude mcp list   # verify it shows api-log-test as connected
 }
 ```
 
-Inspect tools locally with: `uv run fastmcp dev src/api_log_test_mcp/server.py`.
+Inspect tools locally with the MCP Inspector (FastMCP 3.x):
+```bash
+uv run fastmcp dev inspector -m api_log_test_mcp.server:mcp
+```
+The `-m` (module) form is required so the package's relative imports resolve. Or list/call tools
+without a browser:
+```bash
+uv run fastmcp list --command "python -m api_log_test_mcp.server"
+```
 
 ## Configuration
 

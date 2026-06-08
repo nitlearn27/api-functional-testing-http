@@ -166,6 +166,7 @@ class CaseEvidence(BaseModel):
     match_mode: MatchMode | None = None
     response_passed: bool | None = None
     response_diffs: list[ResponseDiff] = Field(default_factory=list)
+    expected_response: Any = None
     actual_body: Any = None
     # log validation
     validated_logs: bool = False

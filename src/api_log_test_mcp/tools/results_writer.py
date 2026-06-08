@@ -281,6 +281,9 @@ def _fill_evidence_sheet(sheet, ev: CaseEvidence, run_at: str) -> None:
     rows.append(["actual_status", _s(ev.actual_status)])
     rows.append(["match_mode", _s(ev.match_mode)])
     rows.append(["latency_ms", "" if ev.latency_ms is None else _s(round(ev.latency_ms, 1))])
+    # Expected vs actual response bodies side by side, so a case can be validated at a glance.
+    rows += [[], ["expected_result", _json(ev.expected_response)]]
+    rows.append(["actual_result", _json(ev.actual_body)])
     if ev.response_diffs:
         rows.append(["diffs"])
         for d in ev.response_diffs:
@@ -288,7 +291,6 @@ def _fill_evidence_sheet(sheet, ev: CaseEvidence, run_at: str) -> None:
                              f"(expected={d.expected!r}, actual={d.actual!r})"])
     else:
         rows.append(["diffs", "(none)"])
-    rows.append(["actual_body", _json(ev.actual_body)])
 
     if not ev.validated_logs:
         log_status = "not validated"

@@ -29,6 +29,12 @@ from ..models import MatchMode, TestCase
 ANY = "<<any>>"
 JSON_HEADERS = {"Content-Type": "application/json"}
 
+# Expected status for request-body validation failures. The spec uses 422 (Unprocessable
+# Entity) for field-level errors, but the target Mulesoft app cannot return 422, so the suite
+# expects 400 Bad Request for every body-validation scenario. Set back to 422 to follow the
+# spec verbatim once the platform supports it.
+BODY_VALIDATION_STATUS = 400
+
 # Sheet header order — mirrors the hand-written sample and the parser's COLUMNS.
 SHEET_COLUMNS = [
     "test_id", "description", "method", "url", "headers", "body", "auth_required",
@@ -79,9 +85,46 @@ class _SuiteBuilder:
     def __init__(self, spec: dict[str, Any]) -> None:
         self.spec = spec
         self.base_path = _base_path(spec)
+        self.error_schema = _error_schema(spec)
         self.cases: list[TestCase] = []
         self.categories: dict[str, int] = {}
         self._n = 0
+
+    def _error_expected(self, code: int) -> dict[str, Any]:
+        """json_subset expectation for the spec's standard error envelope.
+
+        Emits every field the spec's error schema declares: ``status`` is asserted to equal
+        the HTTP code and ``error`` to equal the reason phrase; all other fields (timestamp,
+        message, path, errors, ...) are existence-only (``<<any>>``) since their values are
+        dynamic. Falls back to a minimal ``{status, error}`` envelope when the spec declares
+        no structured error body.
+        """
+        props = self.error_schema.get("properties")
+        if not props:
+            return {"status": code, "error": REASON.get(code, ANY)}
+        expected: dict[str, Any] = {}
+        for field in props:
+            if field == "status":
+                expected[field] = code
+            elif field == "error":
+                expected[field] = REASON.get(code, ANY)
+            else:
+                expected[field] = ANY
+        return expected
+
+    def _success_expected(self, op: dict[str, Any], echo: dict[str, Any] | None = None) -> Any:
+        """json_subset expectation for an operation's 2xx response, derived from the schema.
+
+        Every required field of the success-response schema is asserted to exist (``<<any>>``);
+        ``echo`` overlays concrete values the request itself sends (e.g. a create payload),
+        leaving server-generated fields as existence-only. Returns ``None`` when the operation
+        declares no structured success body.
+        """
+        schema = _success_schema(self.spec, op)
+        expected: dict[str, Any] = {field: ANY for field in schema.get("required", [])}
+        if echo:
+            expected.update(echo)
+        return expected or None
 
     def _add(
         self,
@@ -131,7 +174,7 @@ class _SuiteBuilder:
             "GET",
             "/products?" + urlencode({"page": 1, "pageSize": 20, "sortBy": "price"}),
             expected_status=200,
-            expected_response={"page": ANY, "pageSize": ANY, "totalCount": ANY, "items": ANY},
+            expected_response=self._success_expected(op),
         )
         for param in op.get("parameters", []):
             if param.get("in") != "query":
@@ -145,7 +188,7 @@ class _SuiteBuilder:
                     "GET",
                     "/products?" + urlencode({name: value}),
                     expected_status=400,
-                    expected_response=_error_expected(400),
+                    expected_response=self._error_expected(400),
                 )
         self._add(
             "auth",
@@ -154,7 +197,7 @@ class _SuiteBuilder:
             "/products",
             headers={"Authorization": "Bearer invalid-token"},
             expected_status=401,
-            expected_response=_error_expected(401),
+            expected_response=self._error_expected(401),
         )
 
     def _build_create(self, op: dict[str, Any] | None) -> None:
@@ -164,9 +207,6 @@ class _SuiteBuilder:
         baseline = copy.deepcopy(example) if example else _example_from_schema(self.spec, schema)
         required = schema.get("required", [])
 
-        expected = copy.deepcopy(baseline)
-        expected["id"] = ANY
-        expected["createdDate"] = ANY
         self._add(
             "positive",
             "Create product — valid payload → 201",
@@ -175,21 +215,26 @@ class _SuiteBuilder:
             headers=dict(JSON_HEADERS),
             body=baseline,
             expected_status=201,
-            expected_response=expected,
+            expected_response=self._success_expected(op, echo=copy.deepcopy(baseline)),
         )
 
+        # All request-body validation failures are expected as 400 Bad Request. The spec
+        # documents 422 (Unprocessable Entity) for field-level errors, but the Mulesoft
+        # implementation cannot produce 422, so the suite folds every body-validation
+        # scenario (missing field, bad pattern/enum/length/bounds, array rules, extra field)
+        # into the 400 bucket. See BODY_VALIDATION_STATUS.
         for field in required:
             body = copy.deepcopy(baseline)
             body.pop(field, None)
             self._add(
                 "body_validation",
-                f"Create product — missing required '{field}' → 422",
+                f"Create product — missing required '{field}' → {BODY_VALIDATION_STATUS}",
                 "POST",
                 "/products",
                 headers=dict(JSON_HEADERS),
                 body=body,
-                expected_status=422,
-                expected_response=_error_expected(422),
+                expected_status=BODY_VALIDATION_STATUS,
+                expected_response=self._error_expected(BODY_VALIDATION_STATUS),
             )
 
         for field, pschema in schema.get("properties", {}).items():
@@ -204,13 +249,13 @@ class _SuiteBuilder:
                 body[field] = value
                 self._add(
                     "body_validation",
-                    f"Create product — {label} → 422",
+                    f"Create product — {label} → {BODY_VALIDATION_STATUS}",
                     "POST",
                     "/products",
                     headers=dict(JSON_HEADERS),
                     body=body,
-                    expected_status=422,
-                    expected_response=_error_expected(422),
+                    expected_status=BODY_VALIDATION_STATUS,
+                    expected_response=self._error_expected(BODY_VALIDATION_STATUS),
                 )
 
         if schema.get("additionalProperties") is False:
@@ -218,13 +263,14 @@ class _SuiteBuilder:
             body["unexpectedField"] = "x"
             self._add(
                 "body_validation",
-                "Create product — unexpected extra field (additionalProperties:false) → 422",
+                "Create product — unexpected extra field (additionalProperties:false) "
+                f"→ {BODY_VALIDATION_STATUS}",
                 "POST",
                 "/products",
                 headers=dict(JSON_HEADERS),
                 body=body,
-                expected_status=422,
-                expected_response=_error_expected(422),
+                expected_status=BODY_VALIDATION_STATUS,
+                expected_response=self._error_expected(BODY_VALIDATION_STATUS),
             )
 
         # Deliberately malformed JSON, sent verbatim as a raw (non-JSON) cell.
@@ -236,7 +282,7 @@ class _SuiteBuilder:
             headers=dict(JSON_HEADERS),
             body='{"name": "Broken", "sku": }',
             expected_status=400,
-            expected_response=_error_expected(400),
+            expected_response=self._error_expected(400),
         )
 
         self._add(
@@ -247,7 +293,7 @@ class _SuiteBuilder:
             headers={"Content-Type": "text/plain"},
             body=baseline,
             expected_status=415,
-            expected_response=_error_expected(415),
+            expected_response=self._error_expected(415),
         )
 
     def _build_get_by_name(self, op: dict[str, Any] | None) -> None:
@@ -263,7 +309,7 @@ class _SuiteBuilder:
             "GET",
             "/products/" + quote(valid),
             expected_status=200,
-            expected_response={"name": ANY, "id": ANY},
+            expected_response=self._success_expected(op),
         )
         for label, value in _schema_negatives("name", schema):
             self._add(
@@ -272,7 +318,7 @@ class _SuiteBuilder:
                 "GET",
                 "/products/" + quote(str(value)),
                 expected_status=400,
-                expected_response=_error_expected(400),
+                expected_response=self._error_expected(400),
             )
         self._add(
             "not_found",
@@ -280,7 +326,7 @@ class _SuiteBuilder:
             "GET",
             "/products/" + quote("Quantum Flux Capacitor"),
             expected_status=404,
-            expected_response=_error_expected(404),
+            expected_response=self._error_expected(404),
         )
 
     def _request_body(self, op: dict[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -313,9 +359,40 @@ def _deref(spec: dict[str, Any], node: Any) -> Any:
     return node
 
 
-def _error_expected(code: int) -> dict[str, Any]:
-    """json_subset expectation for the standard error envelope (dynamic fields ignored)."""
-    return {"status": code, "error": REASON.get(code, ANY)}
+def _error_schema(spec: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the error-envelope schema the spec uses for its 4xx/5xx responses.
+
+    Generic: scans operations for the first response with a status >= 400 and returns its
+    resolved JSON schema (following ``$ref`` into ``components/responses`` and
+    ``components/schemas``). Returns ``{}`` when the spec declares no structured error body,
+    in which case callers fall back to a minimal envelope.
+    """
+    for path_item in spec.get("paths", {}).values():
+        if not isinstance(path_item, dict):
+            continue
+        for op in path_item.values():
+            if not isinstance(op, dict):
+                continue
+            for status, resp in op.get("responses", {}).items():
+                if not str(status).startswith(("4", "5")):
+                    continue
+                resp = _deref(spec, resp)
+                schema = resp.get("content", {}).get("application/json", {}).get("schema", {})
+                schema = _deref(spec, schema)
+                if schema.get("properties"):
+                    return schema
+    return {}
+
+
+def _success_schema(spec: dict[str, Any], op: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the JSON schema of an operation's first 2xx response (``{}`` if none)."""
+    for status, resp in op.get("responses", {}).items():
+        if not str(status).startswith("2"):
+            continue
+        resp = _deref(spec, resp)
+        schema = resp.get("content", {}).get("application/json", {}).get("schema", {})
+        return _deref(spec, schema)
+    return {}
 
 
 def _schema_negatives(name: str, schema: dict[str, Any]) -> list[tuple[str, Any]]:

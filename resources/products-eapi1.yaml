@@ -9,7 +9,7 @@ info:
     OAuth 2.0 or HTTP Basic Authentication.
 
 servers:
-  - url: https://api.example.com/products/v1
+  - url: https://products-api4-nlyxhy.5sc6y6-2.usa-e2.cloudhub.io/api
     description: Production server
 
 security:

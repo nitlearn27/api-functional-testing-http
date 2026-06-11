@@ -1,0 +1,50 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "api-log-test-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // The agents SDK dynamically imports the optional `ai` package on its MCP-client path,
+  // which this server never uses. Alias it to a local stub so it doesn't get bundled.
+  "alias": { "ai": "./src/stub-ai.ts" },
+
+  // Two Durable Objects:
+  //   TestMcpServer — the MCP front door (Streamable HTTP, per-session)
+  //   JobRunner     — one instance per job_id; owns the run + DO alarms
+  "durable_objects": {
+    "bindings": [
+      { "name": "TestMcpServer", "class_name": "TestMcpServer" },
+      { "name": "JobRunner", "class_name": "JobRunner" },
+      // FileStore holds a generated/result .xlsx and serves it at GET /files/{id}.
+      { "name": "FILES", "class_name": "FileStore" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TestMcpServer", "JobRunner"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["FileStore"]
+    }
+  ],
+
+  // Behaviour tunables — same names/defaults as the Python ALT_* settings.
+  "vars": {
+    "PROPAGATION_WAIT_SECONDS": 60,
+    "LOG_FETCH_MAX_RETRIES": 3,
+    "LOG_FETCH_RETRY_WAIT_SECONDS": 60,
+    // Whole-log fallback when no log lines carry the correlation id — required for the
+    // current app, which does not log the inbound X-Correlation-ID (Python default: true).
+    "LOG_CORRELATION_FALLBACK": true,
+    // The Worker's public origin, used to build /files/{id} download links.
+    "PUBLIC_BASE_URL": "https://api-log-test-worker.nit4infy1.workers.dev"
+  }
+
+  // Anypoint credentials are SECRETS, not vars. Set locally in .dev.vars and in
+  // production via `wrangler secret put`:
+  //   application_logs_fetch_url, token_endpoint, client_id, client_secret, grant_type
+}

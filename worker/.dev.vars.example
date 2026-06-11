@@ -1,0 +1,7 @@
+# Anypoint credentials (secrets) — copy to .dev.vars for local dev; never commit .dev.vars.
+# In production set these with `wrangler secret put <name>`.
+application_logs_fetch_url=
+token_endpoint=
+client_id=
+client_secret=
+grant_type=client_credentials

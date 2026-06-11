@@ -8,3 +8,14 @@ build/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# Node / Cloudflare Worker
+node_modules/
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
+# Generated test-suite + result workbooks (regenerable from the .yaml specs)
+resources/*_suite.xlsx
+resources/*_results.xlsx
+resources/results-*.xlsx

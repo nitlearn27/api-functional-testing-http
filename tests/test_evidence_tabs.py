@@ -113,7 +113,7 @@ def test_evidence_tab_created_with_request_and_logs(tmp_path):
 
     assert "TC-001" in load_workbook(path).sheetnames
     text = _tab_text(path, "TC-001")
-    assert "RESULT: PASS" in text
+    assert "RESULT: ✅ PASS" in text
     assert "2026-06-04 21:00:00" in text
     assert "https://api.test/orders" in text
     assert "start log [correlationId: TC-001-abc]" in text

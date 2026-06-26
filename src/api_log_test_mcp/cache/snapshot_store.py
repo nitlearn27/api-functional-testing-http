@@ -24,6 +24,11 @@ DEFAULT_CORRELATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A new log event starts with its own timestamp (ISO ``T`` or space separated). Continuation
+# lines of a multi-line Mule event (boxed exception, stack frames) have none, which is how we
+# tell a continuation apart from a fresh, uncorrelated event.
+NEW_EVENT_PREFIX = re.compile(r"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+
 
 @dataclass
 class Snapshot:
@@ -77,8 +82,18 @@ class SnapshotStore:
     def _build_index(self, raw: RawSnapshot) -> dict[str, list[str]]:
         index: dict[str, list[str]] = {}
         for lines in raw.lines_by_instance.values():
+            # A Mule/CloudHub log event is a header line carrying the correlation id followed by
+            # continuation lines (boxed exception, stack trace) that have no id of their own.
+            # Carry the last-seen id forward onto those continuation lines so the whole event
+            # groups under it — but a fresh, timestamped event with no id (e.g. a scheduler
+            # heartbeat) resets it.
+            current: str | None = None
             for line in lines:
                 match = self._pattern.search(line)
                 if match:
-                    index.setdefault(match.group(1), []).append(line)
+                    current = match.group(1)
+                elif NEW_EVENT_PREFIX.match(line):
+                    current = None
+                if current is not None:
+                    index.setdefault(current, []).append(line)
         return index

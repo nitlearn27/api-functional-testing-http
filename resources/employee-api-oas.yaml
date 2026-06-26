@@ -1,0 +1,228 @@
+openapi: 3.0.3
+info:
+  title: Orders API
+  version: 1.0.0
+  description: API for managing customer orders.
+servers:
+  - url: https://order-eapi-impl-nlyxhy.5sc6y6-2.usa-e2.cloudhub.io/api
+    description: Production server deployed in CloudHub with id 351c3653-f9db-4a6a-864a-624f7b5eaa91
+paths:
+  /orders:
+    get:
+      summary: Retrieve a list of orders
+      parameters:
+        - name: customerId
+          in: query
+          description: Filter orders by customer ID
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: Filter orders by status
+          required: false
+          schema:
+            type: string
+            enum:
+              - pending
+              - confirmed
+              - shipped
+              - delivered
+              - cancelled
+        - name: page
+          in: query
+          description: Page number for pagination
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: pageSize
+          in: query
+          description: Number of orders per page
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: A list of orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No orders found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Create a new order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customerId:
+                  type: string
+                items:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/OrderItem'
+                shippingAddress:
+                  $ref: '#/components/schemas/ShippingAddress'
+                notes:
+                  type: string
+                couponCode:
+                  type: string
+                paymentMethod:
+                  type: string
+                  enum:
+                    - credit_card
+                    - debit_card
+                    - paypal
+                    - bank_transfer
+                deliveryDate:
+                  type: string
+                  format: date
+              required:
+                - customerId
+                - items
+                - shippingAddress
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Validation failure or missing mandatory fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Duplicate order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Business rule violation (e.g., out-of-stock)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    Order:
+      type: object
+      required:
+        - orderId
+      properties:
+        orderId:
+          type: string
+        customerId:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        shippingAddress:
+          $ref: '#/components/schemas/ShippingAddress'
+        status:
+          type: string
+          enum:
+            - pending
+            - confirmed
+            - shipped
+            - delivered
+            - cancelled
+        createdAt:
+          type: string
+          format: date-time
+        notes:
+          type: string
+        couponCode:
+          type: string
+        paymentMethod:
+          type: string
+          enum:
+            - credit_card
+            - debit_card
+            - paypal
+            - bank_transfer
+        deliveryDate:
+          type: string
+          format: date
+    OrderItem:
+      type: object
+      properties:
+        productId:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+      required:
+        - productId
+        - quantity
+    ShippingAddress:
+      type: object
+      properties:
+        street:
+          type: string
+        city:
+          type: string
+        country:
+          type: string
+        postalCode:
+          type: string
+      required:
+        - street
+        - city
+        - country
+        - postalCode
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: string

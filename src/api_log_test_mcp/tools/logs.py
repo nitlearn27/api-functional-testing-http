@@ -21,15 +21,32 @@ from ..models import LogMatchMode, LogValidationResult
 _STORE = SnapshotStore()
 
 
-def build_log_source(log_source: str, settings: Settings) -> LogSource:
-    """Construct the LogSource named by a case's ``log_source`` column value."""
+def build_log_source(
+    log_source: str,
+    settings: Settings,
+    *,
+    application_logs_fetch_url: str | None = None,
+) -> LogSource:
+    """Construct the LogSource named by a case's ``log_source`` column value.
+
+    For ``anypoint`` the log-fetch URL comes from the suite sheet
+    (``application_logs_fetch_url``), not ``.env``; it is required, so an empty value raises.
+    """
     name = (log_source or "").lower()
     if name == "file":
         if not settings.file_log_path:
             raise ValueError("ALT_FILE_LOG_PATH must be set when log_source=file")
         return FileLogSource(settings.file_log_path)
     if name == "anypoint":
-        return AnypointLogSource(get_anypoint_settings())
+        if not application_logs_fetch_url:
+            raise ValueError(
+                "application_logs_fetch_url not set in the suite "
+                "(add an 'application_logs_fetch_url | <url>' metadata row)"
+            )
+        anypoint = get_anypoint_settings().model_copy(
+            update={"application_logs_fetch_url": application_logs_fetch_url}
+        )
+        return AnypointLogSource(anypoint)
     raise ValueError(f"unsupported log source: {log_source!r}")
 
 
@@ -38,11 +55,16 @@ def snapshot_logs(
     instances: list[str] | None = None,
     *,
     log_source: str | None = None,
+    application_logs_fetch_url: str | None = None,
     store: SnapshotStore | None = None,
 ) -> str:
     """Download logs once and return a snapshot_id handle."""
     store = store or _STORE
-    source = build_log_source(log_source or settings.log_backend.value, settings)
+    source = build_log_source(
+        log_source or settings.log_backend.value,
+        settings,
+        application_logs_fetch_url=application_logs_fetch_url,
+    )
     snap = store.create(source, instances)
     return snap.snapshot_id
 

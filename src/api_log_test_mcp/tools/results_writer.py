@@ -24,12 +24,41 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from openpyxl.styles import Font, PatternFill
+
 from ..models import CaseEvidence, CaseReport, SuiteReport
 from .suite import RESULTS_MARKER, _as_str, _find_header_row, _load_rows
 
 RESULTS_HEADER = [
     "test_id", "status", "actual_status", "expected_status", "correlation_id", "detail",
 ]
+
+# ✅/❌ status icons render in colour everywhere; the fills/fonts below add the rest of the polish.
+PASS_ICON = "✅ PASS"
+FAIL_ICON = "❌ FAIL"
+
+
+def _fill(color: str) -> PatternFill:
+    return PatternFill("solid", fgColor=color)
+
+
+# Cell styles (font, optional fill) keyed by role — mirrors the worker's xlsx-js-style palette.
+_STYLES: dict[str, tuple[Font, PatternFill | None]] = {
+    "banner": (Font(bold=True, size=13, color="FFFFFFFF"), _fill("FF1F3864")),
+    "header": (Font(bold=True, color="FF1F3864"), _fill("FFD9E1F2")),
+    "pass": (Font(bold=True, color="FF0B6E2D"), _fill("FFE6F4EA")),
+    "fail": (Font(bold=True, color="FFB3261E"), _fill("FFFCE8E6")),
+    "section": (Font(bold=True, color="FF1F3864"), _fill("FFEFEFEF")),
+    "label": (Font(bold=True, color="FF555555"), None),
+    "title": (Font(bold=True, size=12, color="FF1F3864"), None),
+}
+
+
+def _style(cell, role: str) -> None:
+    font, fill = _STYLES[role]
+    cell.font = font
+    if fill is not None:
+        cell.fill = fill
 
 
 class ResultsWriteError(Exception):
@@ -73,12 +102,14 @@ def write_results(path: str, report: SuiteReport, run_at: str | None = None) -> 
 
 
 def _build_block(report: SuiteReport, run_at: str) -> list[list[str]]:
-    summary = f"RESULTS — run {run_at}  (passed {report.passed}/{report.total})"
+    # Keep the cell starting with "RESULTS" (the parser's stop marker) — the icon goes at the end.
+    overall = "✅" if report.failed == 0 else "❌"
+    summary = f"RESULTS — run {run_at}  (passed {report.passed}/{report.total}) {overall}"
     rows: list[list[str]] = [[summary], list(RESULTS_HEADER)]
     for case in report.cases:
         rows.append([
             case.test_id,
-            "PASS" if case.passed else "FAIL",
+            PASS_ICON if case.passed else FAIL_ICON,
             "" if case.actual_status is None else str(case.actual_status),
             "" if case.expected_status is None else str(case.expected_status),
             case.correlation_id or "",
@@ -146,10 +177,33 @@ def _append_xlsx(file_path: Path, block: list[list[str]]) -> None:
     # below the data. Anchor on the true last non-empty row and write from there instead.
     row = _last_data_row(sheet) + 2  # +1 blank separator, then the block
     for line in block:
+        cells = []
         for col, val in enumerate(line, start=1):
-            sheet.cell(row=row, column=col, value=val)
+            cells.append(sheet.cell(row=row, column=col, value=val))
+        _style_block_row(sheet, row, line, cells)
         row += 1
+    _widen(sheet, {"A": 16, "B": 12, "C": 13, "D": 14, "E": 22, "F": 64})
     workbook.save(file_path)
+
+
+def _style_block_row(sheet, row: int, line: list[str], cells: list) -> None:
+    """Colour a RESULTS-block row: banner, header, or the PASS/FAIL status cell."""
+    first = line[0] if line else ""
+    if first.lower().startswith(RESULTS_MARKER):
+        _style(cells[0], "banner")
+        sheet.merge_cells(
+            start_row=row, start_column=1, end_row=row, end_column=len(RESULTS_HEADER)
+        )
+    elif line == RESULTS_HEADER:
+        for cell in cells:
+            _style(cell, "header")
+    elif len(line) > 1 and line[1] in (PASS_ICON, FAIL_ICON):
+        _style(cells[1], "pass" if line[1] == PASS_ICON else "fail")
+
+
+def _widen(sheet, widths: dict[str, int]) -> None:
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
 
 
 def _last_data_row(sheet) -> int:
@@ -261,22 +315,26 @@ def _safe_sheet_name(test_id: str, used: set[str]) -> str:
 
 def _fill_evidence_sheet(sheet, ev: CaseEvidence, run_at: str) -> None:
     """Lay out one case's evidence as vertical key/value sections."""
+    result_icon = PASS_ICON if ev.passed else FAIL_ICON
     rows: list[list[Any]] = [
-        [f"{ev.test_id} — evidence", f"run {run_at}", f"RESULT: {'PASS' if ev.passed else 'FAIL'}"],
+        [f"{ev.test_id} — evidence", f"run {run_at}", f"RESULT: {result_icon}"],
     ]
     if ev.description:
         rows.append([ev.description])
     if ev.error:
         rows.append(["error", ev.error])
 
-    rows += [[], ["[Request]"]]
+    rows += [[], ["📋 [Request]"]]
     rows.append(["method", ev.method or ""])
     rows.append(["url", ev.url or ""])
     rows.append(["headers", _json(ev.request_headers)])
     rows.append(["body", _json(ev.request_body)])
 
-    resp_status = "" if ev.response_passed is None else ("PASS" if ev.response_passed else "FAIL")
-    rows += [[], ["[Response validation]", resp_status]]
+    if ev.response_passed is None:
+        resp_status = ""
+    else:
+        resp_status = PASS_ICON if ev.response_passed else FAIL_ICON
+    rows += [[], ["🔎 [Response validation]", resp_status]]
     rows.append(["expected_status", _s(ev.expected_status)])
     rows.append(["actual_status", _s(ev.actual_status)])
     rows.append(["match_mode", _s(ev.match_mode)])
@@ -295,8 +353,8 @@ def _fill_evidence_sheet(sheet, ev: CaseEvidence, run_at: str) -> None:
     if not ev.validated_logs:
         log_status = "not validated"
     else:
-        log_status = "PASS" if ev.logs_passed else "FAIL"
-    rows += [[], ["[Log validation]", log_status]]
+        log_status = PASS_ICON if ev.logs_passed else FAIL_ICON
+    rows += [[], ["📜 [Log validation]", log_status]]
     if ev.validated_logs:
         rows.append(["log_source", ev.log_source or ""])
         rows.append(["correlation_id", ev.correlation_id or ""])
@@ -310,9 +368,36 @@ def _fill_evidence_sheet(sheet, ev: CaseEvidence, run_at: str) -> None:
                 rows.append(["", extra])
 
     for r, line in enumerate(rows, start=1):
+        cells = {}
         for c, val in enumerate(line, start=1):
             if val not in (None, ""):
-                sheet.cell(row=r, column=c, value=val)
+                cells[c] = sheet.cell(row=r, column=c, value=val)
+        _style_evidence_row(r, line, cells)
+    _widen(sheet, {"A": 22, "B": 66, "C": 16})
+
+
+def _style_evidence_row(row: int, line: list[Any], cells: dict) -> None:
+    """Style an evidence row: title, coloured RESULT/status, section headers and labels."""
+    c0 = str(line[0]) if line else ""
+    c1 = str(line[1]) if len(line) > 1 else ""
+    if row == 1:
+        if 1 in cells:
+            _style(cells[1], "title")
+        result = str(line[2]) if len(line) > 2 else ""
+        if 3 in cells:
+            _style(cells[3], "pass" if "PASS" in result else "fail")
+    elif "[" in c0 or c0 in ("expected_log_string", "expected_result", "diffs"):
+        if 1 in cells:
+            _style(cells[1], "section")
+        if 2 in cells:
+            if "PASS" in c1:
+                _style(cells[2], "pass")
+            elif "FAIL" in c1:
+                _style(cells[2], "fail")
+            else:
+                _style(cells[2], "section")
+    elif c0 and 1 in cells:
+        _style(cells[1], "label")
 
 
 def _json(value: Any) -> str:

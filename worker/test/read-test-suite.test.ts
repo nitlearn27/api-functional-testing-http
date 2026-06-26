@@ -46,6 +46,7 @@ const ROWS: Record<string, unknown>[] = [
 function sampleSuiteBytes(): Uint8Array {
   const aoa: unknown[][] = [
     ["Basepath", "https://api.example.test/"],
+    ["application_logs_fetch_url", "https://logs.example.test/deployments/abc"],
     ["Auth"],
     [],
     HEADERS,
@@ -62,6 +63,20 @@ describe("read_test_suite", () => {
     const suite = readTestSuite(sampleSuiteBytes());
     expect(suite.base_path).toBe("https://api.example.test/");
     expect(new Set(suite.cases.map((c) => c.test_id))).toEqual(new Set(["order-001", "pay-042"]));
+  });
+
+  it("parses application_logs_fetch_url from the metadata block", () => {
+    const suite = readTestSuite(sampleSuiteBytes());
+    expect(suite.application_logs_fetch_url).toBe("https://logs.example.test/deployments/abc");
+  });
+
+  it("application_logs_fetch_url is null when the metadata row is absent", () => {
+    const aoa: unknown[][] = [["Basepath", "https://api.example.test/"], ["test_id", "method", "url"], ["TC-1", "GET", "/x"]];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "tests");
+    const suite = readTestSuite(XLSX.write(wb, { type: "array", bookType: "xlsx" }) as Uint8Array);
+    expect(suite.application_logs_fetch_url).toBeNull();
   });
 
   it("collects parse errors", () => {

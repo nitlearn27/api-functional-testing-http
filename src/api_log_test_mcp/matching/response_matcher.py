@@ -3,7 +3,9 @@
 Three modes:
 - ``exact``       — deep equality of the whole body.
 - ``json_subset`` — every key/value in ``expected`` must appear in ``actual`` (actual may
-                    have extra keys); lists are compared element-wise by index.
+                    have extra keys). A single-node expected list ``[tmpl]`` is a template
+                    checked against EVERY actual element (any-length list); a multi-node expected
+                    list is matched positionally (extra actual elements ignored).
 - ``schema``      — ``expected`` is treated as a JSON Schema and validated against ``actual``.
 
 ``ignore_paths`` are dotted paths (e.g. ``data.id``, ``items.*.timestamp``) that are pruned
@@ -124,7 +126,16 @@ def _compare(expected: Any, actual: Any, *, path: str, subset: bool) -> list[Res
     if isinstance(expected, list):
         if not isinstance(actual, list):
             return [_type_diff(path, expected, actual)]
-        if len(expected) != len(actual):
+        # json_subset with a single-node template: that node is checked against EVERY actual
+        # element, so a list of any length passes iff every element matches the template (the
+        # count is irrelevant). An empty actual list passes vacuously.
+        if subset and len(expected) == 1:
+            for idx, item in enumerate(actual):
+                diffs.extend(_compare(expected[0], item, path=_join(path, str(idx)), subset=subset))
+            return diffs
+        # exact mode, or a multi-node expected: positional. Only exact requires the lengths to
+        # match; for json_subset the extra actual nodes beyond the template are ignored.
+        if not subset and len(expected) != len(actual):
             diffs.append(
                 ResponseDiff(
                     path=path,

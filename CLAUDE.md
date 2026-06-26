@@ -55,8 +55,10 @@ when a case sets `auth_required=yes`.
 
 ## Suite sheet (`.numbers` or `.xlsx`)
 
-- A metadata block on top (`Basepath | <url>`), then a header row located by finding the
-  `test_id` column (not assumed to be row 1), then one row per case.
+- A metadata block on top (`Basepath | <url>` and `application_logs_fetch_url | <url>`), then a
+  header row located by finding the `test_id` column (not assumed to be row 1), then one row per
+  case. The `application_logs_fetch_url` row is the CloudHub log-fetch URL — read from the sheet
+  (not `.env`), and **required** when any case validates anypoint logs.
 - Columns: `test_id, description, method, url, headers, body, auth_required, expected_status,
   expected_response, response_match_mode, validate_logs, expected_log_strings, log_match_mode,
   log_source`. Schema lives in `tools/suite.py` `COLUMNS` (with aliases).
@@ -71,10 +73,20 @@ when a case sets `auth_required=yes`.
 - Main settings use the `ALT_` env prefix (e.g. `ALT_FILE_LOG_PATH`,
   `ALT_PROPAGATION_WAIT_SECONDS` (default 60), `ALT_LOG_FETCH_MAX_RETRIES` (default 3),
   `ALT_LOG_FETCH_RETRY_WAIT_SECONDS` (default 60), `ALT_LOG_CORRELATION_FALLBACK`).
-- **Anypoint** credentials/URL are read from `.env` with plain lowercase keys (no prefix):
-  `application_logs_fetch_url`, `token_endpoint`, `client_id`, `client_secret`, `grant_type`.
-  The loader accepts both `=` and `:` separators. `.env` is gitignored — never commit secrets,
-  never print the token/secret.
+- **Anypoint** credentials are read from `.env` with plain lowercase keys (no prefix):
+  `token_endpoint`, `client_id`, `client_secret`, `grant_type`. The loader accepts both `=` and
+  `:` separators. `.env` is gitignored — never commit secrets, never print the token/secret.
+  The per-suite log-fetch URL (`application_logs_fetch_url`) is **not** read from `.env` for a
+  hand-written sheet — it travels with the suite and is injected by `tools/logs.build_log_source`.
+- `deployments_base_url` (`.env`, plain lowercase; a Worker secret) is the `.../deployments` base.
+  Suite generation appends `/<deployment-id>` — the first UUID in the spec's
+  `servers[0].description` — to **auto-fill** the generated suite's `application_logs_fetch_url`
+  (blank if the base or id is missing).
+- **Worker tools** are consolidated to TWO, both of which *run* tests: **`run_schema`** (OpenAPI
+  schema → generate the suite AND run it, in one call) and **`run_suite`** (run an existing
+  suite_id / uploaded `.xlsx`). Skills: `run-schema` and `run-suite` (scripts of the same names in
+  `worker/scripts/`). The Python server keeps its granular tools (`generate_test_suite`,
+  `generate_and_run`, `run_and_record`, `run_suite`, …) — see the "Tools (MCP)" section.
 
 ## Conventions / guardrails
 
@@ -90,5 +102,6 @@ when a case sets `auth_required=yes`.
   400 (a real API finding, not a framework bug).
 - CloudHub log validation works but uses **whole-log fallback** because the app doesn't log the
   inbound `X-Correlation-ID` yet.
-- Deferred: build the log URL dynamically from application id + version (currently fixed in
-  `.env`, isolated in `AnypointLogSource._log_url()`); target-API OAuth.
+- The generated-suite log URL is now built from `deployments_base_url` + the spec's deployment id
+  at generation time (no longer hand-fixed in `.env` for the generate path). Still deferred:
+  target-API OAuth.

@@ -118,7 +118,7 @@ export class AnypointLogSource implements LogSource {
 
   async snapshot(_instances?: string[] | null): Promise<RawSnapshot> {
     const url = await this.logUrl();
-    if (!url) throw new AnypointLogError("application_logs_fetch_url is not set in .env");
+    if (!url) throw new AnypointLogError("application_logs_fetch_url is not set in the suite");
     const response = await this.getWithRetry(url);
     const lines = await parseLogBody(response);
     return { lines_by_instance: { [INSTANCE]: lines } };

@@ -30,6 +30,7 @@ function jsonResponse(status: number, body: unknown): ApiResponse {
 
 const SUITE: TestSuite = {
   base_path: "https://api.test/",
+  application_logs_fetch_url: null,
   parse_errors: [],
   cases: [
     makeTestCase({ test_id: "TC-001", method: "POST", url: "/orders", auth_required: false, body: { sku: "ABC-100", qty: 2 }, expected_status: 201, expected_response: { status: "ACCEPTED", sku: "ABC-100" }, response_match_mode: "json_subset" }),
@@ -71,6 +72,7 @@ describe("orchestrate — request phase", () => {
   it("auth_required case fails with the stub message", async () => {
     const suite: TestSuite = {
       base_path: null,
+      application_logs_fetch_url: null,
       parse_errors: [],
       cases: [makeTestCase({ test_id: "TC-AUTH", url: "https://api.test/x", auth_required: true })],
     };
@@ -101,6 +103,7 @@ describe("orchestrate — log phase", () => {
   it("validates strictly on the correlation line only and merges results", async () => {
     const logSuite: TestSuite = {
       base_path: "https://api.test/",
+      application_logs_fetch_url: "https://logs.example.test/deployments/abc",
       parse_errors: [],
       cases: [
         makeTestCase({ test_id: "TC-1", method: "POST", url: "/orders", auth_required: false, expected_status: 201, validate_logs: true, expected_log_strings: ["Order lookup succeeded"], log_source: "anypoint" }),
@@ -138,6 +141,7 @@ describe("orchestrate — log phase", () => {
   it("skips the log phase entirely when no case opts in", async () => {
     const noLogSuite: TestSuite = {
       base_path: null,
+      application_logs_fetch_url: null,
       parse_errors: [],
       cases: [makeTestCase({ test_id: "TC-1", url: "https://api.test/x", auth_required: false, expected_status: 201, validate_logs: false })],
     };

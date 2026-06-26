@@ -42,8 +42,8 @@ def test_write_results_appends_block_and_preserves_cases(tmp_path):
     flat = ["|".join(str(c) for c in r) for r in rows]
 
     assert any("RESULTS — run 2026-06-03 21:00:00" in line for line in flat)
-    assert any(line.startswith("TC-001|PASS|201|201|TC-001-evid01") for line in flat)
-    assert any(line.startswith("TC-002|FAIL|201|400|TC-002-evid02") for line in flat)
+    assert any(line.startswith("TC-001|✅ PASS|201|201|TC-001-evid01") for line in flat)
+    assert any(line.startswith("TC-002|❌ FAIL|201|400|TC-002-evid02") for line in flat)
     assert any("correlation_id" in line for line in flat)  # header column present
 
     # the suite still parses to exactly the two original cases (results block ignored)

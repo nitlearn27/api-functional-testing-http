@@ -32,6 +32,51 @@ def test_exact_rejects_extra_keys():
     assert any("unexpected key" in d.message for d in result.diffs)
 
 
+def test_json_subset_single_node_template_passes_any_count():
+    result = assert_response(
+        actual_body=[{"a": 1}, {"a": 2}, {"a": 3}],
+        expected=[{"a": "<<any>>"}],
+        mode=MatchMode.JSON_SUBSET,
+    )
+    assert result.passed  # every object matches the template, count irrelevant
+
+
+def test_json_subset_single_node_template_checks_every_object():
+    result = assert_response(
+        actual_body=[{"a": 1}, {"b": 2}],  # second object missing `a`
+        expected=[{"a": "<<any>>"}],
+        mode=MatchMode.JSON_SUBSET,
+    )
+    assert not result.passed
+    assert any(d.path == "1.a" and d.message == "missing key" for d in result.diffs)
+
+
+def test_json_subset_empty_list_passes_single_node_template():
+    result = assert_response(
+        actual_body=[], expected=[{"a": "<<any>>"}], mode=MatchMode.JSON_SUBSET
+    )
+    assert result.passed  # no objects to check
+
+
+def test_json_subset_multi_node_template_is_positional():
+    result = assert_response(
+        actual_body=[{"a": 1}, {"b": 2}, {"c": 3}],
+        expected=[{"a": "<<any>>"}, {"b": "<<any>>"}],
+        mode=MatchMode.JSON_SUBSET,
+    )
+    assert result.passed  # index 0,1 match; index 2 ignored
+
+
+def test_exact_still_requires_equal_list_length():
+    result = assert_response(
+        actual_body=[{"a": 1}, {"a": 2}],
+        expected=[{"a": 1}],
+        mode=MatchMode.EXACT,
+    )
+    assert not result.passed
+    assert any(d.message == "list length mismatch" for d in result.diffs)
+
+
 def test_ignore_paths_prune_volatile_fields():
     result = assert_response(
         actual_body={"id": "xyz", "data": {"ts": 123, "v": 1}},

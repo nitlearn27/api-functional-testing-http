@@ -21,6 +21,7 @@ async function rpc(method: string, params: unknown): Promise<any> {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       ...(session ? { "mcp-session-id": session } : {}),
+      ...(process.env.MCP_TOKEN ? { Authorization: `Bearer ${process.env.MCP_TOKEN}` } : {}),
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
   });
@@ -51,32 +52,32 @@ async function main() {
   const tools = (await rpc("tools/list", {})).tools.map((t: any) => t.name);
   console.log(`tools: ${tools.join(", ")}\n`);
 
-  // 2. generate_test_suite (yaml -> xlsx)
-  console.log("[generate_test_suite] products spec -> xlsx");
-  const gen = await call("generate_test_suite", { spec_yaml: SPEC });
+  // 2. run_schema (yaml -> generate suite + run); we only check the generation summary here.
+  console.log("[run_schema] products spec -> generated suite + started run");
+  const gen = await call("run_schema", { spec_yaml: SPEC });
   console.log(`  base_path=${gen.base_path}  case_count=${gen.case_count}`);
   console.log(`  categories=${JSON.stringify(gen.cases_by_category)}`);
   if (gen.case_count !== 41) throw new Error("expected 41 cases");
-  if (!gen.download_url) throw new Error("missing download_url");
-  ok(`generated 41 cases, download_url + ${gen.cases.length} cases returned (no base64)`);
+  if (!gen.suite_download_url) throw new Error("missing suite_download_url");
+  ok(`generated 41 cases, suite_download_url + job_id=${gen.job_id} returned`);
 
   // 3. exactly the two consolidated tools are exposed
-  if (tools.length !== 2 || !tools.includes("generate_test_suite") || !tools.includes("run_test_suite")) {
-    throw new Error(`expected exactly [generate_test_suite, run_test_suite], got: ${tools.join(", ")}`);
+  if (tools.length !== 2 || !tools.includes("run_schema") || !tools.includes("run_suite")) {
+    throw new Error(`expected exactly [run_schema, run_suite], got: ${tools.join(", ")}`);
   }
   ok("tool list is exactly the 2 consolidated tools");
 
   // 4. download the suite via the link and parse it locally (round-trip check)
   console.log("\n[download] fetch the link, parse the workbook locally");
-  const suiteBytes = Buffer.from(await (await fetch(gen.download_url)).arrayBuffer());
+  const suiteBytes = Buffer.from(await (await fetch(gen.suite_download_url)).arrayBuffer());
   const dlWb = XLSX.read(suiteBytes, { type: "buffer" });
   const dlRows = XLSX.utils.sheet_to_json<unknown[]>(dlWb.Sheets[dlWb.SheetNames[0]], { header: 1 });
   const dlCases = dlRows.filter((row) => /^TC-/.test(String(row[0] ?? ""))).length;
   if (dlCases !== 41) throw new Error(`round-trip mismatch: ${dlCases} cases`);
   ok(`link downloads a valid .xlsx with 41 case rows (${suiteBytes.length} bytes)`);
 
-  // 5. run_test_suite (real fetch to example.com, no logs) — start + re-call with job_id
-  console.log("\n[run_test_suite] 2-case suite vs example.com, status_only");
+  // 5. run_suite (real fetch to example.com, no logs) — start + re-call with job_id
+  console.log("\n[run_suite] 2-case suite vs example.com, status_only");
   const aoa = [
     ["Basepath", "https://example.com"],
     ["test_id", "method", "url", "auth_required", "expected_status", "response_match_mode", "validate_logs"],
@@ -87,12 +88,12 @@ async function main() {
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), "tests");
   const fileB64 = Buffer.from(XLSX.write(wb, { type: "array", bookType: "xlsx" }) as Uint8Array).toString("base64");
 
-  let status: any = await call("run_test_suite", { file_b64: fileB64 });
+  let status: any = await call("run_suite", { file_b64: fileB64 });
   console.log(`  job_id=${status.job_id}  status=${status.status}`);
 
   for (let i = 0; i < 20 && status.status !== "complete" && status.status !== "error"; i++) {
     await new Promise((r) => setTimeout(r, 2000));
-    status = await call("run_test_suite", { job_id: status.job_id });
+    status = await call("run_suite", { job_id: status.job_id });
   }
   console.log(`  final status=${status.status}  run_at=${status.run_at}`);
   const r = status.report;

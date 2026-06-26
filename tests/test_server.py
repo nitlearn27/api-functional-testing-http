@@ -14,6 +14,7 @@ EXPECTED_TOOLS = {
     "call_api",
     "run_suite",
     "run_and_record",
+    "generate_and_run",
 }
 
 

@@ -61,6 +61,8 @@ export interface ParseError {
 
 export interface TestSuite {
   base_path: string | null;
+  // CloudHub log-fetch URL from the suite metadata; required to validate anypoint logs.
+  application_logs_fetch_url: string | null;
   cases: TestCase[];
   parse_errors: ParseError[];
 }

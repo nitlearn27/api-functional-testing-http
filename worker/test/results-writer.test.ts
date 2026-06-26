@@ -47,8 +47,8 @@ describe("buildResultWorkbook", () => {
     const flat = flatten(out);
 
     expect(flat.some((l) => l.includes("RESULTS — run 2026-06-03 21:00:00"))).toBe(true);
-    expect(flat.some((l) => l.startsWith("TC-001|PASS|201|201|TC-001-evid01"))).toBe(true);
-    expect(flat.some((l) => l.startsWith("TC-002|FAIL|201|400|TC-002-evid02"))).toBe(true);
+    expect(flat.some((l) => l.startsWith("TC-001|✅ PASS|201|201|TC-001-evid01"))).toBe(true);
+    expect(flat.some((l) => l.startsWith("TC-002|❌ FAIL|201|400|TC-002-evid02"))).toBe(true);
     expect(flat.some((l) => l.includes("correlation_id"))).toBe(true);
 
     const suite = readTestSuite(out);

@@ -42,18 +42,20 @@ export function readTestSuite(bytes: Uint8Array): TestSuite {
   try {
     rows = loadRows(bytes);
   } catch (exc) {
-    return { base_path: null, cases: [], parse_errors: [{ row: 0, column: null, message: `could not read sheet: ${errMsg(exc)}` }] };
+    return { base_path: null, application_logs_fetch_url: null, cases: [], parse_errors: [{ row: 0, column: null, message: `could not read sheet: ${errMsg(exc)}` }] };
   }
 
   const headerIdx = findHeaderRow(rows);
   if (headerIdx === null) {
-    return { base_path: null, cases: [], parse_errors: [{ row: 0, column: null, message: "no header row containing 'test_id' found" }] };
+    return { base_path: null, application_logs_fetch_url: null, cases: [], parse_errors: [{ row: 0, column: null, message: "no header row containing 'test_id' found" }] };
   }
 
-  const basePath = extractBasePath(rows.slice(0, headerIdx));
+  const metaRows = rows.slice(0, headerIdx);
+  const basePath = extractBasePath(metaRows);
+  const logUrl = extractLogUrl(metaRows);
   const headerMap = mapHeaders(rows[headerIdx]);
 
-  const suite: TestSuite = { base_path: basePath, cases: [], parse_errors: [] };
+  const suite: TestSuite = { base_path: basePath, application_logs_fetch_url: logUrl, cases: [], parse_errors: [] };
   const seenIds = new Set<string>();
   const tidIdx = headerMap["test_id"];
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -91,12 +93,13 @@ function findHeaderRow(rows: Cell[][]): number | null {
 }
 
 const BASE_LABELS = new Set(["basepath", "base_path", "base path", "baseurl", "base_url", "base url"]);
+const LOG_URL_LABELS = new Set(["application_logs_fetch_url", "applicationlogsfetchurl", "logs_fetch_url", "application_logs_url", "log_url"]);
 
-function extractBasePath(metaRows: Cell[][]): string | null {
+function extractMetaValue(metaRows: Cell[][], labels: Set<string>): string | null {
   for (const row of metaRows) {
     if (!row || row.length === 0) continue;
     const label = asStr(row[0]);
-    if (label && BASE_LABELS.has(label.toLowerCase())) {
+    if (label && labels.has(label.toLowerCase())) {
       for (const cell of row.slice(1)) {
         const value = asStr(cell);
         if (value) return value;
@@ -104,6 +107,14 @@ function extractBasePath(metaRows: Cell[][]): string | null {
     }
   }
   return null;
+}
+
+function extractBasePath(metaRows: Cell[][]): string | null {
+  return extractMetaValue(metaRows, BASE_LABELS);
+}
+
+function extractLogUrl(metaRows: Cell[][]): string | null {
+  return extractMetaValue(metaRows, LOG_URL_LABELS);
 }
 
 function mapHeaders(headerRow: Cell[]): Record<string, number> {

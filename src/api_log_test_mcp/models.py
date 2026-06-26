@@ -65,6 +65,9 @@ class TestSuite(BaseModel):
     """Result of parsing a suite sheet: good cases plus collected parse errors."""
 
     base_path: str | None = None
+    # CloudHub log-download URL read from the suite's metadata block. The source of truth for
+    # log validation — required when any case validates anypoint logs (no .env fallback).
+    application_logs_fetch_url: str | None = None
     cases: list[TestCase] = Field(default_factory=list)
     parse_errors: list[ParseError] = Field(default_factory=list)
 

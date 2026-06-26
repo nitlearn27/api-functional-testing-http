@@ -105,7 +105,7 @@ def test_snapshot_retries_until_correlation_present(monkeypatch):
     monkeypatch.setattr(orchestrate.time, "sleep", lambda s: slept.append(s))
 
     settings = Settings(log_fetch_max_retries=3, log_fetch_retry_wait_seconds=60)
-    sid = orchestrate._snapshot_with_retry(settings, "anypoint", ["TC-1-x"])
+    sid = orchestrate._snapshot_with_retry(settings, "anypoint", ["TC-1-x"], "https://logs.test/x")
 
     assert sid == "s1"            # stopped as soon as the id appeared
     assert fetched == ["s0", "s1"]
@@ -125,7 +125,7 @@ def test_snapshot_retry_gives_up_after_max(monkeypatch):
     monkeypatch.setattr(orchestrate.time, "sleep", lambda s: slept.append(s))
 
     settings = Settings(log_fetch_max_retries=2, log_fetch_retry_wait_seconds=60)
-    sid = orchestrate._snapshot_with_retry(settings, "anypoint", ["TC-1-x"])
+    sid = orchestrate._snapshot_with_retry(settings, "anypoint", ["TC-1-x"], "https://logs.test/x")
 
     assert sid == "s2"               # 1 initial + 2 retries
     assert fetched == ["s0", "s1", "s2"]

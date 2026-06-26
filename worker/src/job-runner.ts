@@ -42,6 +42,7 @@ interface RunnerState {
   error: string | null;
   run_at: string | null;
   suite_b64: string | null;
+  application_logs_fetch_url: string | null;
   parse_errors: ParseError[];
   runs: CaseRun[] | null;
   source_idx: number;
@@ -55,6 +56,7 @@ const EMPTY: RunnerState = {
   error: null,
   run_at: null,
   suite_b64: null,
+  application_logs_fetch_url: null,
   parse_errors: [],
   runs: null,
   source_idx: 0,
@@ -143,7 +145,7 @@ export class JobRunner extends Agent<Env, RunnerState> {
         await this.finalizeRun(runs, suite.parse_errors);
         return;
       }
-      this.setState({ ...this.state, status: "waiting_propagation", runs, parse_errors: suite.parse_errors, source_idx: 0, attempt: 0 });
+      this.setState({ ...this.state, status: "waiting_propagation", runs, parse_errors: suite.parse_errors, application_logs_fetch_url: suite.application_logs_fetch_url, source_idx: 0, attempt: 0 });
       await this.schedule(this.propagationWaitSeconds(), "logPhase");
     } catch (exc) {
       this.fail(exc);
@@ -207,8 +209,16 @@ export class JobRunner extends Agent<Env, RunnerState> {
 
   private buildLogSource(source: string): LogSource {
     if (source === "anypoint") {
+      // The log-fetch URL is the suite's, not the Worker env's; required (no fallback).
+      const logUrl = this.state.application_logs_fetch_url;
+      if (!logUrl) {
+        throw new Error(
+          "application_logs_fetch_url not set in the suite " +
+            "(add an 'application_logs_fetch_url | <url>' metadata row)",
+        );
+      }
       return new AnypointLogSource({
-        application_logs_fetch_url: this.env.application_logs_fetch_url,
+        application_logs_fetch_url: logUrl,
         token_endpoint: this.env.token_endpoint,
         client_id: this.env.client_id,
         client_secret: this.env.client_secret,

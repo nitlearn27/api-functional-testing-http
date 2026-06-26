@@ -17,6 +17,27 @@ export { TestMcpServer, JobRunner, FileStore };
 // SQLite-backed DO storage caps a single value at 2 MB; suites are far smaller.
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
 
+// Length-checked constant-time compare (Workers has no crypto.timingSafeEqual).
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+// Shared-bearer gate for the write/exec routes. Fails closed if MCP_AUTH_TOKEN is unset, so a
+// misconfigured deploy denies rather than exposes.
+function isAuthorized(request: Request, env: Env): boolean {
+  const expected = env.MCP_AUTH_TOKEN;
+  if (!expected) return false;
+  const header = request.headers.get("Authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+  return constantTimeEqual(token, expected);
+}
+
+const unauthorized = () =>
+  new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+
 /**
  * Manual suite upload: lets a user push an .xlsx directly (e.g. curl --data-binary) instead of
  * routing base64 through an MCP client model, then run it by suite_id. The workbook is parsed
@@ -45,7 +66,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     parse_errors: suite.parse_errors,
     download_url: stored.url,
     expires_in: "2 hours",
-    run_hint: `Call run_test_suite with { "suite_id": "${stored.id}" } — no file upload needed.`,
+    run_hint: `Call run_suite with { "suite_id": "${stored.id}" } — no file upload needed.`,
   });
 }
 
@@ -66,7 +87,15 @@ export default {
       return new Response("ok", { status: 200 });
     }
 
-    // Manual upload of a suite workbook; returns a suite_id usable in run_test_suite.
+    // Gate the write/exec surfaces (the MCP transport and suite upload). Downloads (/files/{id})
+    // and job status (/jobs/{id}) stay on the unguessable-capability-URL model so browser links
+    // and the helper scripts' plain fetches keep working.
+    const guarded =
+      url.pathname.startsWith("/mcp") ||
+      (url.pathname === "/files" && request.method === "POST");
+    if (guarded && !isAuthorized(request, env)) return unauthorized();
+
+    // Manual upload of a suite workbook; returns a suite_id usable in run_suite.
     if (url.pathname === "/files" && request.method === "POST") {
       return handleUpload(request, env);
     }

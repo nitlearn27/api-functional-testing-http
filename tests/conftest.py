@@ -63,6 +63,7 @@ def sample_suite_path(tmp_path: Path) -> str:
     ws = wb.active
     # Metadata block above the header, like the real sheet.
     ws.append(["Basepath", "https://api.example.test/"])
+    ws.append(["application_logs_fetch_url", "https://logs.example.test/deployments/abc"])
     ws.append(["Auth"])
     ws.append([])
     ws.append(HEADERS)

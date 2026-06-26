@@ -77,7 +77,7 @@ def _run(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, 
     # Phase 2: log validation (one snapshot per distinct source, reused across cases).
     active_snapshots: list[str] = []
     try:
-        _validate_logs_phase(runs, settings, active_snapshots)
+        _validate_logs_phase(runs, settings, active_snapshots, suite.application_logs_fetch_url)
     finally:
         if not retain_snapshots:
             for sid in active_snapshots:
@@ -178,7 +178,10 @@ def _failed_run(case: TestCase, correlation_id: str, error: str) -> _CaseRun:
 
 
 def _validate_logs_phase(
-    runs: list[_CaseRun], settings: Settings, active_snapshots: list[str]
+    runs: list[_CaseRun],
+    settings: Settings,
+    active_snapshots: list[str],
+    application_logs_fetch_url: str | None,
 ) -> None:
     """Snapshot once per distinct log_source and validate each opted-in case against it."""
     log_runs = [r for r in runs if r.case.validate_logs and r.correlation_id]
@@ -197,7 +200,9 @@ def _validate_logs_phase(
     for source_name, group in by_source.items():
         correlation_ids = [r.correlation_id for r in group if r.correlation_id]
         try:
-            sid = _snapshot_with_retry(settings, source_name, correlation_ids)
+            sid = _snapshot_with_retry(
+                settings, source_name, correlation_ids, application_logs_fetch_url
+            )
             active_snapshots.append(sid)
         except Exception as exc:  # noqa: BLE001 - attribute the failure to every case in group
             for r in group:
@@ -224,7 +229,10 @@ def _validate_logs_phase(
 
 
 def _snapshot_with_retry(
-    settings: Settings, source_name: str, correlation_ids: list[str]
+    settings: Settings,
+    source_name: str,
+    correlation_ids: list[str],
+    application_logs_fetch_url: str | None,
 ) -> str:
     """Download a log snapshot, retrying until every correlation id's logs have surfaced.
 
@@ -234,12 +242,18 @@ def _snapshot_with_retry(
     most recent snapshot id is returned even if some ids never showed up (those cases then fail
     honestly rather than blocking forever).
     """
-    sid = snapshot_logs(settings, log_source=source_name)
+    sid = snapshot_logs(
+        settings, log_source=source_name,
+        application_logs_fetch_url=application_logs_fetch_url,
+    )
     for _ in range(max(0, settings.log_fetch_max_retries)):
         if all(correlation_present(sid, cid) for cid in correlation_ids):
             break
         if settings.log_fetch_retry_wait_seconds > 0:
             time.sleep(settings.log_fetch_retry_wait_seconds)
         discard_snapshot(sid)
-        sid = snapshot_logs(settings, log_source=source_name)
+        sid = snapshot_logs(
+        settings, log_source=source_name,
+        application_logs_fetch_url=application_logs_fetch_url,
+    )
     return sid

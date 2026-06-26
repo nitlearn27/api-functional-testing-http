@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -23,6 +24,7 @@ from urllib.parse import quote, urlencode
 import yaml
 from openpyxl import Workbook
 
+from ..config import get_anypoint_settings
 from ..models import MatchMode, TestCase
 
 # Wildcard sentinel honoured by the response matcher (field must exist, value not compared).
@@ -48,6 +50,32 @@ REASON = {
     409: "Conflict", 415: "Unsupported Media Type", 422: "Unprocessable Entity",
 }
 
+# Standard error types the Mulesoft APIkit Router raises, by HTTP status. Used as the default
+# expected_log_strings so every generated case validates that the router logged the right error
+# type (e.g. a 400 case asserts "APIKIT:BAD_REQUEST" appears in the CloudHub logs).
+APIKIT_ERROR_TYPES = {
+    400: "APIKIT:BAD_REQUEST",
+    404: "APIKIT:NOT_FOUND",
+    405: "APIKIT:METHOD_NOT_ALLOWED",
+    406: "APIKIT:NOT_ACCEPTABLE",
+    415: "APIKIT:UNSUPPORTED_MEDIA_TYPE",
+    501: "APIKIT:NOT_IMPLEMENTED",
+}
+
+
+def _expected_log_strings(status: int, method: str, url: str) -> list[str]:
+    """Expected log strings for a case.
+
+    Error cases assert the APIkit router's error type; non-error cases (2xx success, 401 auth)
+    assert the request line ``<METHOD> <path>`` — Mule logs it on every routed request (e.g.
+    "Processing GET /orders request" contains "GET /orders"), so the success case never has a
+    blank expectation. The query string is dropped (the logger omits it).
+    """
+    error_type = APIKIT_ERROR_TYPES.get(status)
+    if error_type:
+        return [error_type]
+    return [f"{method} {url.split('?')[0]}"]
+
 
 def generate_test_suite(spec_path: str, output_path: str | None = None) -> dict[str, Any]:
     """Read an OpenAPI YAML spec at ``spec_path`` and write a runnable .xlsx test suite.
@@ -66,14 +94,39 @@ def generate_test_suite(spec_path: str, output_path: str | None = None) -> dict[
         if output_path
         else Path(spec_path).with_name(Path(spec_path).stem + "_suite.xlsx")
     )
-    _write_sheet(out, builder.base_path, builder.cases)
+    # Pre-fill the CloudHub log-fetch URL when a deployments base is configured and the spec's
+    # server description carries a deployment id; otherwise leave it blank for the user to fill.
+    logs_fetch_url = _deployment_logs_url(spec, get_anypoint_settings().deployments_base_url)
+    _write_sheet(out, builder.base_path, builder.cases, logs_fetch_url)
 
     return {
         "output_path": str(out),
         "base_path": builder.base_path,
+        "application_logs_fetch_url": logs_fetch_url,
         "case_count": len(builder.cases),
         "cases_by_category": builder.categories,
     }
+
+
+_DEPLOYMENT_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _deployment_logs_url(spec: dict[str, Any], base: str | None) -> str | None:
+    """Build ``<base>/<deployment-id>`` from the first UUID in ``servers[0].description``.
+
+    Returns ``None`` when no base is configured or no id is present, so the sheet cell stays
+    blank (back-compat with hand-filled suites).
+    """
+    if not base:
+        return None
+    servers = spec.get("servers") or []
+    description = str(servers[0].get("description", "")) if servers else ""
+    match = _DEPLOYMENT_ID_RE.search(description)
+    if not match:
+        return None
+    return f"{base.rstrip('/')}/{match.group(0)}"
 
 
 # --- case building ---------------------------------------------------------------------
@@ -112,19 +165,49 @@ class _SuiteBuilder:
                 expected[field] = ANY
         return expected
 
-    def _success_expected(self, op: dict[str, Any], echo: dict[str, Any] | None = None) -> Any:
-        """json_subset expectation for an operation's 2xx response, derived from the schema.
+    def _success_expected(
+        self, op: dict[str, Any], echo: dict[str, Any] | None = None
+    ) -> tuple[Any, MatchMode] | None:
+        """Expectation (value + match mode) for an operation's 2xx response, from the schema.
 
-        Every required field of the success-response schema is asserted to exist (``<<any>>``);
-        ``echo`` overlays concrete values the request itself sends (e.g. a create payload),
-        leaving server-generated fields as existence-only. Returns ``None`` when the operation
-        declares no structured success body.
+        For an object body this is a json_subset asserting existence (``<<any>>``) of only the
+        schema's *declared* ``required`` fields — never the optional ones. When the schema declares
+        no required fields, the expectation is a bare ``<<any>>`` (accept any object body). ``echo``
+        overlays concrete values the request itself sends (e.g. a create payload).
+
+        A list endpoint returns an *array* body (e.g. GET /orders). It gets a single-node template:
+        ``[{required field: "<<any>>", …}]`` when the item declares required fields, else
+        ``["<<any>>"]``. Under json_subset that one node is checked against EVERY object in the
+        response (any count), so the whole list is validated; a user can replace it with multiple
+        node templates to assert specific nodes positionally.
+
+        Returns ``None`` when the operation declares no structured success body.
         """
         schema = _success_schema(self.spec, op)
-        expected: dict[str, Any] = {field: ANY for field in schema.get("required", [])}
+        if schema.get("type") == "array":
+            return _array_any_template(self.spec, schema), MatchMode.JSON_SUBSET
+        # Object success body: assert existence (<<any>>) of only the schema's *declared* required
+        # fields — never optional ones. ``echo`` overlays concrete request values (create cases).
+        node: dict[str, Any] = {field: ANY for field in schema.get("required", [])}
         if echo:
-            expected.update(echo)
-        return expected or None
+            node.update(echo)
+        if node:
+            return node, MatchMode.JSON_SUBSET
+        # No declared required fields (and nothing echoed): accept any object body with <<any>>,
+        # but only when the operation declares a structured body (else no expectation at all).
+        if schema.get("type") == "object" or schema.get("properties"):
+            return ANY, MatchMode.JSON_SUBSET
+        return None
+
+    def _success_kwargs(
+        self, op: dict[str, Any], echo: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """``_add`` kwargs (expected_response + response_match_mode) for an operation's 2xx body."""
+        result = self._success_expected(op, echo)
+        if result is None:
+            return {"expected_response": None}
+        expected, mode = result
+        return {"expected_response": expected, "response_match_mode": mode}
 
     def _add(
         self,
@@ -137,6 +220,7 @@ class _SuiteBuilder:
         body: Any = None,
         headers: dict[str, Any] | None = None,
         expected_response: Any = None,
+        response_match_mode: MatchMode = MatchMode.JSON_SUBSET,
     ) -> None:
         self._n += 1
         self.cases.append(
@@ -150,8 +234,12 @@ class _SuiteBuilder:
                 auth_required=False,
                 expected_status=expected_status,
                 expected_response=expected_response,
-                response_match_mode=MatchMode.JSON_SUBSET,
-                validate_logs=False,
+                response_match_mode=response_match_mode,
+                # Validate logs on every case so each run exercises both the API and the CloudHub
+                # log endpoint; error cases assert the APIkit router's error type, 2xx/401 assert
+                # nothing specific (still fetched, so a missing/blank log endpoint surfaces).
+                validate_logs=True,
+                expected_log_strings=_expected_log_strings(expected_status, method, url),
                 log_source="anypoint",
             )
         )
@@ -174,7 +262,7 @@ class _SuiteBuilder:
             "GET",
             "/products?" + urlencode({"page": 1, "pageSize": 20, "sortBy": "price"}),
             expected_status=200,
-            expected_response=self._success_expected(op),
+            **self._success_kwargs(op),
         )
         for param in op.get("parameters", []):
             if param.get("in") != "query":
@@ -204,7 +292,7 @@ class _SuiteBuilder:
         if not op:
             return
         schema, example = self._request_body(op)
-        baseline = copy.deepcopy(example) if example else _example_from_schema(self.spec, schema)
+        baseline = copy.deepcopy(example) if example else _sample_value(self.spec, schema)
         required = schema.get("required", [])
 
         self._add(
@@ -215,7 +303,7 @@ class _SuiteBuilder:
             headers=dict(JSON_HEADERS),
             body=baseline,
             expected_status=201,
-            expected_response=self._success_expected(op, echo=copy.deepcopy(baseline)),
+            **self._success_kwargs(op, echo=copy.deepcopy(baseline)),
         )
 
         # All request-body validation failures are expected as 400 Bad Request. The spec
@@ -309,7 +397,7 @@ class _SuiteBuilder:
             "GET",
             "/products/" + quote(valid),
             expected_status=200,
-            expected_response=self._success_expected(op),
+            **self._success_kwargs(op),
         )
         for label, value in _schema_negatives("name", schema):
             self._add(
@@ -395,6 +483,20 @@ def _success_schema(spec: dict[str, Any], op: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _array_any_template(spec: dict[str, Any], schema: dict[str, Any]) -> list[Any]:
+    """A single-node ``<<any>>`` template for an array success body.
+
+    When the item schema declares ``required`` fields it yields ``[{field: "<<any>>", …}]`` (only
+    those fields); otherwise — no declared required fields, or scalar items — it yields
+    ``["<<any>>"]`` (each element accepted).
+    """
+    items = _deref(spec, schema.get("items", {}))
+    required = items.get("required") or []
+    if required:
+        return [{field: ANY for field in required}]
+    return [ANY]
+
+
 def _schema_negatives(name: str, schema: dict[str, Any]) -> list[tuple[str, Any]]:
     """Constraint violations for a scalar leaf schema as ``(label, violating_value)`` pairs."""
     out: list[tuple[str, Any]] = []
@@ -430,25 +532,81 @@ def _array_negatives(name: str, schema: dict[str, Any]) -> list[tuple[str, Any]]
     return out
 
 
-def _example_from_schema(spec: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
-    """Fallback valid body built from per-property ``example`` values (required fields only)."""
-    required = set(schema.get("required", []))
-    out = {}
-    for field, pschema in schema.get("properties", {}).items():
-        pschema = _deref(spec, pschema)
-        if field in required and "example" in pschema:
-            out[field] = pschema["example"]
-    return out
+def _sample_value(spec: dict[str, Any], schema: dict[str, Any]) -> Any:
+    """A schema-valid sample request body, with a concrete value for EVERY required field.
+
+    Recurses into nested objects and arrays so the positive case sends a complete valid payload and
+    each negative case can drop/override exactly one field. Uses a field's ``example`` when given,
+    else synthesizes by type (enum -> first; numbers respect bounds; strings honour common formats
+    and min/maxLength). Optional fields are omitted (a minimal valid body).
+    """
+    schema = _deref(spec, schema)
+    if "example" in schema:
+        return copy.deepcopy(schema["example"])
+    if schema.get("enum"):
+        return schema["enum"][0]
+    t = schema.get("type")
+    if t == "array":
+        count = max(int(schema.get("minItems", 1)), 1)
+        return [_sample_value(spec, schema.get("items", {})) for _ in range(count)]
+    if t in ("integer", "number"):
+        if "minimum" in schema:
+            return schema["minimum"]
+        if "maximum" in schema:
+            return schema["maximum"]
+        return 1
+    if t == "boolean":
+        return True
+    if t == "string":
+        return _sample_string(schema)
+    if t == "object" or schema.get("properties") or schema.get("required"):
+        return _sample_object(spec, schema)
+    return "sample"
+
+
+def _sample_object(spec: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    props = schema.get("properties", {})
+    return {
+        field: _sample_value(spec, props.get(field, {}))
+        for field in schema.get("required", [])
+    }
+
+
+def _sample_string(schema: dict[str, Any]) -> str:
+    fmt = schema.get("format")
+    formats = {
+        "date": "2024-01-01",
+        "date-time": "2024-01-01T00:00:00Z",
+        "email": "user@example.com",
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "uri": "https://example.com",
+    }
+    if fmt in formats:
+        return formats[fmt]
+    s = "sample"
+    if isinstance(schema.get("minLength"), int) and len(s) < schema["minLength"]:
+        s = s.ljust(schema["minLength"], "x")
+    if isinstance(schema.get("maxLength"), int) and len(s) > schema["maxLength"]:
+        s = s[: schema["maxLength"]]
+    return s
 
 
 # --- sheet writing ---------------------------------------------------------------------
 
 
-def _write_sheet(out_path: Path, base_path: str | None, cases: list[TestCase]) -> None:
+def _write_sheet(
+    out_path: Path,
+    base_path: str | None,
+    cases: list[TestCase],
+    logs_fetch_url: str | None = None,
+) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "tests"
     ws.append(["Basepath", base_path or ""])
+    # CloudHub log-fetch URL — auto-filled from deployments_base_url + the spec's deployment id
+    # when available; otherwise blank for the user to fill. Required to validate anypoint logs.
+    ws.append(["application_logs_fetch_url", logs_fetch_url or ""])
     ws.append(["Auth"])
     ws.append(SHEET_COLUMNS)
     for case in cases:

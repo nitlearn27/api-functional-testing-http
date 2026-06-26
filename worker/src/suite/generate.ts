@@ -28,6 +28,30 @@ const REASON: Record<number, string> = {
   409: "Conflict", 415: "Unsupported Media Type", 422: "Unprocessable Entity",
 };
 
+// Standard error types the Mulesoft APIkit Router raises, by HTTP status. Used as the default
+// expected_log_strings so every generated case validates that the router logged the right error
+// type (e.g. a 400 case asserts "APIKIT:BAD_REQUEST" appears in the CloudHub logs).
+const APIKIT_ERROR_TYPES: Record<number, string> = {
+  400: "APIKIT:BAD_REQUEST",
+  404: "APIKIT:NOT_FOUND",
+  405: "APIKIT:METHOD_NOT_ALLOWED",
+  406: "APIKIT:NOT_ACCEPTABLE",
+  415: "APIKIT:UNSUPPORTED_MEDIA_TYPE",
+  501: "APIKIT:NOT_IMPLEMENTED",
+};
+
+/**
+ * Expected log strings for a case. Error cases assert the APIkit router's error type; non-error
+ * cases (2xx success, 401 auth) assert the request line `<METHOD> <path>` — Mule logs it on every
+ * routed request (e.g. "Processing GET /orders request" contains "GET /orders"), so the success
+ * case never has a blank expectation. The query string is dropped (the logger omits it).
+ */
+function expectedLogStrings(status: number, method: string, url: string): string[] {
+  const errorType = APIKIT_ERROR_TYPES[status];
+  if (errorType) return [errorType];
+  return [`${method} ${url.split("?")[0]}`];
+}
+
 type Json = Record<string, any>;
 
 export interface GenerateSummary {
@@ -36,15 +60,36 @@ export interface GenerateSummary {
   cases_by_category: Record<string, number>;
 }
 
-export function generateTestSuite(specYaml: string): { summary: GenerateSummary; bytes: Uint8Array } {
+export function generateTestSuite(
+  specYaml: string,
+  deploymentsBaseUrl?: string,
+): { summary: GenerateSummary; bytes: Uint8Array } {
   const spec = parseYaml(specYaml) as Json;
   const builder = new SuiteBuilder(spec);
   builder.build();
-  const bytes = writeSheet(builder.basePath, builder.cases);
+  // Pre-fill the suite's CloudHub log-fetch URL when a deployments base is configured and the
+  // spec's server description carries a deployment id; otherwise leave it blank for the user.
+  const logsFetchUrl = deploymentLogsUrl(spec, deploymentsBaseUrl);
+  const bytes = writeSheet(builder.basePath, builder.cases, logsFetchUrl);
   return {
     summary: { base_path: builder.basePath, case_count: builder.cases.length, cases_by_category: builder.categories },
     bytes,
   };
+}
+
+const DEPLOYMENT_ID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
+
+/**
+ * Build the suite's `application_logs_fetch_url` as `<base>/<deployment-id>`. The id is the first
+ * UUID in `servers[0].description` (e.g. "…deployed in CloudHub with id 351c3653-…"). Returns null
+ * when no base is configured or no id is present — the cell then stays blank (back-compat).
+ */
+export function deploymentLogsUrl(spec: Json, base?: string): string | null {
+  if (!base) return null;
+  const description = String(spec.servers?.[0]?.description ?? "");
+  const id = description.match(DEPLOYMENT_ID_RE)?.[0];
+  if (!id) return null;
+  return `${base.replace(/\/+$/, "")}/${id}`;
 }
 
 // --- case building ---------------------------------------------------------------------
@@ -75,16 +120,35 @@ class SuiteBuilder {
     return expected;
   }
 
-  private successExpected(op: Json, echo?: Json): Json | null {
+  private successExpected(op: Json, echo?: Json): { expected: unknown; mode: MatchMode } | null {
     const schema = successSchema(this.spec, op);
-    const expected: Json = {};
-    for (const field of schema.required ?? []) expected[field] = ANY;
-    if (echo) Object.assign(expected, echo);
-    return Object.keys(expected).length ? expected : null;
+
+    // A list endpoint returns an *array* success body (e.g. GET /orders). Emit a readable
+    // single-node `<<any>>` template: `[{ field: "<<any>>", … }]`. Under json_subset that one node
+    // is checked against EVERY object in the response (any count), so the whole list is validated;
+    // a user can replace it with multiple node templates to assert specific nodes positionally.
+    if (schema.type === "array") {
+      return { expected: arrayAnyTemplate(this.spec, schema), mode: "json_subset" };
+    }
+
+    // Object success body. Assert existence (<<any>>) of only the schema's *declared* required
+    // fields — never the optional ones (a response model with no `required` shouldn't force every
+    // property). `echo` overlays concrete values the request itself sends (create cases).
+    const node: Json = {};
+    for (const field of schema.required ?? []) node[field] = ANY;
+    if (echo) Object.assign(node, echo);
+    if (Object.keys(node).length) return { expected: node, mode: "json_subset" };
+    // No declared required fields (and nothing echoed): accept any object body with `<<any>>`, but
+    // only when the operation actually declares a structured body (else no expectation at all).
+    if (schema.type === "object" || schema.properties) {
+      return { expected: ANY, mode: "json_subset" };
+    }
+    return null;
   }
 
   private add(category: string, description: string, method: string, url: string, opts: {
     expected_status: number; body?: unknown; headers?: Json; expected_response?: unknown;
+    response_match_mode?: MatchMode;
   }): void {
     this.n += 1;
     this.cases.push(makeTestCase({
@@ -97,8 +161,12 @@ class SuiteBuilder {
       auth_required: false,
       expected_status: opts.expected_status,
       expected_response: opts.expected_response ?? null,
-      response_match_mode: "json_subset" as MatchMode,
-      validate_logs: false,
+      response_match_mode: opts.response_match_mode ?? ("json_subset" as MatchMode),
+      // Validate logs on every case so each run exercises both the API and the CloudHub log
+      // endpoint; error cases assert the APIkit router's error type, 2xx/401 assert nothing
+      // specific (still fetched, so a missing/blank log endpoint surfaces).
+      validate_logs: true,
+      expected_log_strings: expectedLogStrings(opts.expected_status, method, url),
       log_source: "anypoint",
     }));
     this.categories[category] = (this.categories[category] ?? 0) + 1;
@@ -135,14 +203,16 @@ class SuiteBuilder {
     let headers: Json = {};
     if (hasJsonBody) {
       const [schema, example] = this.requestBody(op);
-      baseline = (example ? structuredClone(example) : exampleFromSchema(this.spec, schema)) as Json;
+      baseline = (example ? structuredClone(example) : sampleValue(this.spec, schema)) as Json;
       headers = { ...JSON_HEADERS };
     }
     const echo = baseline && ["POST", "PUT", "PATCH"].includes(method) ? structuredClone(baseline) : undefined;
 
     // Positive case (first documented 2xx).
+    const success = this.successExpected(op, echo);
     this.add("positive", `${name} — valid request → ${successStatus}`, method, posUrl,
-      { headers, body: baseline, expected_status: successStatus, expected_response: this.successExpected(op, echo) ?? undefined });
+      { headers, body: baseline, expected_status: successStatus,
+        expected_response: success?.expected, response_match_mode: success?.mode });
 
     // Query-parameter constraint negatives.
     for (const qp of queryParams) {
@@ -309,6 +379,22 @@ function successSchema(spec: Json, op: Json): Json {
   return {};
 }
 
+/**
+ * A single-node `<<any>>` template for an array success body. When the item schema declares
+ * `required` fields it yields `[{ field: "<<any>>", … }]` (only those fields); otherwise — no
+ * declared required fields, or scalar items — it yields `["<<any>>"]` (each element accepted).
+ */
+function arrayAnyTemplate(spec: Json, schema: Json): unknown[] {
+  const items = deref(spec, schema.items ?? {});
+  const required: string[] = items.required ?? [];
+  if (required.length) {
+    const node: Json = {};
+    for (const field of required) node[field] = ANY;
+    return [node];
+  }
+  return [ANY];
+}
+
 function schemaNegatives(name: string, schema: Json): [string, unknown][] {
   const out: [string, unknown][] = [];
   if ("enum" in schema) out.push([`${name} not in allowed enum`, "__INVALID_ENUM__"]);
@@ -341,14 +427,59 @@ function arrayNegatives(name: string, schema: Json): [string, unknown][] {
   return out;
 }
 
-function exampleFromSchema(spec: Json, schema: Json): Json {
-  const required = new Set<string>(schema.required ?? []);
+/**
+ * A schema-valid sample request body. Generates a concrete value for EVERY required field
+ * (recursing into nested objects and arrays), so the positive case sends a complete valid payload
+ * and each negative case can drop/override exactly one field. Uses a field's `example` when given,
+ * else synthesizes by type (enum → first; numbers respect bounds; strings honour common formats and
+ * min/maxLength). Optional fields are omitted (a minimal valid body).
+ */
+function sampleValue(spec: Json, schema: Json): unknown {
+  schema = deref(spec, schema);
+  if (schema.example !== undefined) return structuredClone(schema.example);
+  if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+  switch (schema.type) {
+    case "array": {
+      const count = Math.max(Number(schema.minItems ?? 1), 1);
+      return Array.from({ length: count }, () => sampleValue(spec, schema.items ?? {}));
+    }
+    case "integer":
+    case "number":
+      if (typeof schema.minimum === "number") return schema.minimum;
+      if (typeof schema.maximum === "number") return schema.maximum;
+      return 1;
+    case "boolean":
+      return true;
+    case "string":
+      return sampleString(schema);
+    case "object":
+      return sampleObject(spec, schema);
+    default:
+      return schema.properties || schema.required ? sampleObject(spec, schema) : "sample";
+  }
+}
+
+function sampleObject(spec: Json, schema: Json): Json {
+  const props: Json = schema.properties ?? {};
   const out: Json = {};
-  for (const [field, rawSchema] of Object.entries<Json>(schema.properties ?? {})) {
-    const pschema = deref(spec, rawSchema);
-    if (required.has(field) && "example" in pschema) out[field] = pschema.example;
+  for (const field of (schema.required ?? []) as string[]) {
+    out[field] = sampleValue(spec, props[field] ?? {});
   }
   return out;
+}
+
+function sampleString(schema: Json): string {
+  switch (schema.format) {
+    case "date": return "2024-01-01";
+    case "date-time": return "2024-01-01T00:00:00Z";
+    case "email": return "user@example.com";
+    case "uuid": return "00000000-0000-0000-0000-000000000000";
+    case "uri": return "https://example.com";
+  }
+  let s = "sample";
+  if (typeof schema.minLength === "number" && s.length < schema.minLength) s = s.padEnd(schema.minLength, "x");
+  if (typeof schema.maxLength === "number" && s.length > schema.maxLength) s = s.slice(0, schema.maxLength);
+  return s;
 }
 
 // --- URL helpers (match urllib: urlencode + quote) -------------------------------------
@@ -366,9 +497,12 @@ function quote(s: string): string {
 
 // --- sheet writing ---------------------------------------------------------------------
 
-function writeSheet(basePath: string | null, cases: TestCase[]): Uint8Array {
+function writeSheet(basePath: string | null, cases: TestCase[], logsFetchUrl?: string | null): Uint8Array {
   const aoa: unknown[][] = [
     ["Basepath", basePath ?? ""],
+    // CloudHub log-fetch URL — auto-filled from deployments_base_url + the spec's deployment id
+    // when available; otherwise blank for the user to fill. Required to validate anypoint logs.
+    ["application_logs_fetch_url", logsFetchUrl ?? ""],
     ["Auth"],
     [...SHEET_COLUMNS],
     ...cases.map(caseToRow),

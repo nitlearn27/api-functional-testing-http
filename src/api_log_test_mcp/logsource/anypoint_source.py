@@ -1,8 +1,9 @@
 """AnypointLogSource — download CloudHub application logs from Anypoint.
 
-Implements ``snapshot()`` against the CloudHub 2.0 log-file endpoint configured in ``.env``
-(``application_logs_fetch_url``). One download per run (the snapshot store reuses it across all
-cases), with a small bounded backoff on transient 429/500 responses.
+Implements ``snapshot()`` against the CloudHub 2.0 log-file endpoint. The URL
+(``application_logs_fetch_url``) is read from the test suite sheet and injected into the settings
+by ``tools/logs.build_log_source`` — not from ``.env``. One download per run (the snapshot store
+reuses it across all cases), with a small bounded backoff on transient 429/500 responses.
 
 The configured URL is the deployment base ``.../deployments/{id}``. The spec ``{version}``
 changes on **every redeploy** (a new spec + new replicas), so a pinned version would silently
@@ -58,7 +59,7 @@ class AnypointLogSource(LogSource):
         try:
             url = self._log_url(client)
             if not url:
-                raise AnypointLogError("application_logs_fetch_url is not set in .env")
+                raise AnypointLogError("application_logs_fetch_url is not set in the suite")
             response = self._get_with_retry(client, url)
         finally:
             if owns:

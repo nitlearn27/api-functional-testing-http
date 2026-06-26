@@ -29,6 +29,11 @@ export interface LogSource {
 export const DEFAULT_CORRELATION_PATTERN =
   /(?:correlation[_-]?id["']?\s*[:=]\s*["']?|event:)([A-Za-z0-9._-]+)/i;
 
+// A new log event starts with its own timestamp (ISO `T` or space separated). Continuation lines
+// of a multi-line Mule event (boxed exception, stack frames) have none, which is how we tell a
+// continuation apart from a fresh, uncorrelated event.
+const NEW_EVENT_PREFIX = /^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/;
+
 export class Snapshot {
   constructor(
     public snapshotId: string,
@@ -74,9 +79,16 @@ export class SnapshotStore {
   private buildIndex(raw: RawSnapshot): Record<string, string[]> {
     const index: Record<string, string[]> = {};
     for (const lines of Object.values(raw.lines_by_instance)) {
+      // A Mule/CloudHub log event is a header line carrying the correlation id followed by
+      // continuation lines (boxed exception, stack trace) that have no id of their own. Carry
+      // the last-seen id forward onto those continuation lines so the whole event groups under
+      // it — but a fresh, timestamped event with no id (e.g. a scheduler heartbeat) resets it.
+      let current: string | null = null;
       for (const line of lines) {
         const match = this.pattern.exec(line);
-        if (match) (index[match[1]] ??= []).push(line);
+        if (match) current = match[1];
+        else if (NEW_EVENT_PREFIX.test(line)) current = null;
+        if (current) (index[current] ??= []).push(line);
       }
     }
     return index;

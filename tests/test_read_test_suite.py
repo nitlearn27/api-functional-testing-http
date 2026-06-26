@@ -9,6 +9,26 @@ def test_parses_valid_cases_and_base_path(sample_suite_path):
     assert ids == {"order-001", "pay-042"}
 
 
+def test_parses_application_logs_fetch_url(sample_suite_path):
+    suite = read_test_suite(sample_suite_path)
+    assert suite.application_logs_fetch_url == "https://logs.example.test/deployments/abc"
+
+
+def test_application_logs_fetch_url_absent_is_none(tmp_path):
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Basepath", "https://api.example.test/"])
+    ws.append(["test_id", "method", "url"])
+    ws.append(["TC-1", "GET", "/x"])
+    path = tmp_path / "no_log_url.xlsx"
+    wb.save(path)
+
+    suite = read_test_suite(str(path))
+    assert suite.application_logs_fetch_url is None
+
+
 def test_collects_parse_errors(sample_suite_path):
     suite = read_test_suite(sample_suite_path)
     messages = {(e.column, e.message) for e in suite.parse_errors}

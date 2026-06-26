@@ -3,19 +3,22 @@
  *
  * Faithful port of matching/response_matcher.py. Three body modes plus a status-only mode:
  *   - exact       — deep equality of the whole body (extra keys are diffs).
- *   - json_subset — every key/value in `expected` must appear in `actual` (extras allowed);
- *                   lists compared element-wise by index.
- *   - schema      — `expected` is a JSON Schema validated against `actual` (ajv Draft 2020-12).
+ *   - json_subset — every key/value in `expected` must appear in `actual` (extras allowed). A
+ *                   single-node expected list `[tmpl]` is a template checked against EVERY actual
+ *                   element (any-length list); a multi-node expected list is matched positionally
+ *                   (extra actual elements ignored).
+ *   - schema      — `expected` is a JSON Schema validated against `actual` (Draft 2020-12).
  *
  * `ignore_paths` are dotted paths (`*` wildcard) pruned from both sides before comparison.
  * The wildcard value `<<any>>` requires the field's presence but accepts any value.
+ *
+ * Schema validation uses @cfworker/json-schema rather than ajv: ajv compiles validators with
+ * `new Function()`, which Cloudflare Workers block (eval is disallowed), so ajv throws at runtime.
  */
-import Ajv2020 from "ajv/dist/2020.js";
+import { Validator } from "@cfworker/json-schema";
 import type { AssertResult, MatchMode, ResponseDiff } from "../models.js";
 
 export const ANY_VALUE = "<<any>>";
-
-const ajv = new Ajv2020({ allErrors: true, strict: false });
 
 export interface AssertOptions {
   actual_body: unknown;
@@ -64,14 +67,14 @@ export function assertResponse(opts: AssertOptions): AssertResult {
 // --- schema --------------------------------------------------------------------------
 
 function checkSchema(actual: unknown, schema: unknown): ResponseDiff[] {
-  const validate = ajv.compile(schema as object);
-  validate(actual);
-  const errors = validate.errors ?? [];
-  // Sort by instancePath to mirror jsonschema's absolute-path ordering.
-  const sorted = [...errors].sort((a, b) => a.instancePath.localeCompare(b.instancePath));
+  const validator = new Validator(schema as object, "2020-12");
+  const { errors } = validator.validate(actual);
+  // Sort by instanceLocation to mirror jsonschema's absolute-path ordering. instanceLocation is a
+  // JSON pointer ("#", "#/n", "#/0/orderId"); map it to our dotted path form ("<root>", "n", ...).
+  const sorted = [...errors].sort((a, b) => a.instanceLocation.localeCompare(b.instanceLocation));
   return sorted.map((err) => {
-    const path = err.instancePath ? err.instancePath.replace(/^\//, "").replace(/\//g, ".") : "<root>";
-    return { path, message: err.message ?? "schema error" };
+    const loc = err.instanceLocation.replace(/^#\/?/, "");
+    return { path: loc ? loc.replace(/\//g, ".") : "<root>", message: err.error };
   });
 }
 
@@ -104,7 +107,18 @@ function compare(expected: unknown, actual: unknown, path: string, subset: boole
 
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) return [typeDiff(path, expected, actual)];
-    if (expected.length !== actual.length) {
+    // json_subset with a single-node template: that node is checked against EVERY actual element,
+    // so a list of any length passes iff every element matches the template (the count is
+    // irrelevant). An empty actual list passes vacuously.
+    if (subset && expected.length === 1) {
+      actual.forEach((item, idx) => {
+        diffs.push(...compare(expected[0], item, join(path, String(idx)), subset));
+      });
+      return diffs;
+    }
+    // exact mode, or a multi-node expected: positional. Only exact requires the lengths to match;
+    // for json_subset the extra actual nodes beyond the template are ignored.
+    if (!subset && expected.length !== actual.length) {
       diffs.push({ path, expected: expected.length, actual: actual.length, message: "list length mismatch" });
     }
     for (let idx = 0; idx < expected.length; idx++) {

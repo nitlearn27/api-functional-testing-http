@@ -46,5 +46,8 @@
 
   // Anypoint credentials are SECRETS, not vars. Set locally in .dev.vars and in
   // production via `wrangler secret put`:
-  //   application_logs_fetch_url, token_endpoint, client_id, client_secret, grant_type
+  //   token_endpoint, client_id, client_secret, grant_type
+  //   deployments_base_url  (the ".../environments/<ENV>/deployments" base; generate_test_suite
+  //                          appends "/<deployment-id>" from the spec's server description)
+  // (the per-suite application_logs_fetch_url is NOT a secret — it travels with each suite sheet.)
 }

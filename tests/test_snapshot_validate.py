@@ -2,6 +2,7 @@
 
 from api_log_test_mcp.cache.snapshot_store import SnapshotStore
 from api_log_test_mcp.config import LogBackend, Settings
+from api_log_test_mcp.logsource.base import LogSource, RawSnapshot
 from api_log_test_mcp.models import LogMatchMode
 from api_log_test_mcp.tools import logs as logtools
 from api_log_test_mcp.tools.suite import read_test_suite
@@ -68,6 +69,42 @@ def test_full_mock_suite_run(sample_suite_path, sample_log_path):
         assert results["pay-042"].passed  # "Payment declined" + "gateway slow" both present
     finally:
         assert logtools.discard_snapshot(sid, store=store) is True
+
+
+class _StaticSource(LogSource):
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+
+    def discover_instances(self) -> list[str]:
+        return ["cloudhub"]
+
+    def snapshot(self, instances=None) -> RawSnapshot:
+        return RawSnapshot(lines_by_instance={"cloudhub": self._lines})
+
+
+def test_multiline_event_continuation_lines_group_under_header_id():
+    """A Mule APIKIT:BAD_REQUEST event: only the header carries the correlation id; the boxed
+    message + error type are continuation lines. They must group under the header's id so an
+    expected string on a continuation line is still found (no whole-log fallback)."""
+    event = [
+        "2026-06-17 10:46:54 DefaultExceptionListener [correlationId: TC-004-ff7d9d4a6ab7]",
+        "*" * 80,
+        "Message    : required key [customerId] not found",
+        "Error type : APIKIT:BAD_REQUEST",
+        "*" * 80,
+    ]
+    store = SnapshotStore()
+    snap = store.create(_StaticSource(event))
+    res = logtools.validate_logs(
+        snap.snapshot_id,
+        "TC-004-ff7d9d4a6ab7",
+        ["APIKIT:BAD_REQUEST"],
+        correlation_fallback=False,
+        store=store,
+    )
+    assert res.passed
+    assert res.used_fallback is False
+    assert res.lines_considered == len(event)
 
 
 def test_log_match_mode_enum_default():

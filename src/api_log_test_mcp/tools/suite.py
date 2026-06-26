@@ -65,10 +65,12 @@ def read_test_suite(path: str) -> TestSuite:
             parse_errors=[ParseError(row=0, message="no header row containing 'test_id' found")]
         )
 
-    base_path = _extract_base_path(rows[:header_idx])
+    meta_rows = rows[:header_idx]
+    base_path = _extract_base_path(meta_rows)
+    log_url = _extract_log_url(meta_rows)
     header_map = _map_headers(rows[header_idx])
 
-    suite = TestSuite(base_path=base_path)
+    suite = TestSuite(base_path=base_path, application_logs_fetch_url=log_url)
     seen_ids: set[str] = set()
     tid_idx = header_map["test_id"]
     for offset, raw_row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
@@ -129,19 +131,33 @@ def _find_header_row(rows: list[list[Any]]) -> int | None:
     return None
 
 
-def _extract_base_path(meta_rows: list[list[Any]]) -> str | None:
-    """Find a ``Basepath | <url>`` row in the metadata block above the header."""
+_BASE_PATH_LABELS = {"basepath", "base_path", "base path", "baseurl", "base_url", "base url"}
+_LOG_URL_LABELS = {"application_logs_fetch_url", "applicationlogsfetchurl", "logs_fetch_url",
+                   "application_logs_url", "log_url"}
+
+
+def _extract_meta_value(meta_rows: list[list[Any]], labels: set[str]) -> str | None:
+    """Find ``<label> | <value>`` in the metadata block above the header (first match wins)."""
     for row in meta_rows:
         if not row:
             continue
         label = _as_str(row[0])
-        if label and label.lower() in {"basepath", "base_path", "base path", "baseurl",
-                                       "base_url", "base url"}:
+        if label and label.lower() in labels:
             for cell in row[1:]:
                 value = _as_str(cell)
                 if value:
                     return value
     return None
+
+
+def _extract_base_path(meta_rows: list[list[Any]]) -> str | None:
+    """Find a ``Basepath | <url>`` row in the metadata block above the header."""
+    return _extract_meta_value(meta_rows, _BASE_PATH_LABELS)
+
+
+def _extract_log_url(meta_rows: list[list[Any]]) -> str | None:
+    """Find an ``application_logs_fetch_url | <url>`` row in the metadata block."""
+    return _extract_meta_value(meta_rows, _LOG_URL_LABELS)
 
 
 def _map_headers(header_row: list[Any]) -> dict[str, int]:

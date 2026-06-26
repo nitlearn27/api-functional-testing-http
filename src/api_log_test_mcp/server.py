@@ -1,6 +1,6 @@
 """FastMCP server entry point.
 
-Registers all eight tools so the contract is fixed early. The no-network core plus the
+Registers all nine tools so the contract is fixed early. The no-network core plus the
 end-to-end runners are implemented; ``get_auth_token`` stays a stub until its phase lands.
 """
 
@@ -81,9 +81,18 @@ def assert_response(
 
 
 @mcp.tool
-def snapshot_logs(instances: list[str] | None = None) -> str:
-    """Download logs once via the configured backend and return a snapshot_id handle."""
-    return _logs.snapshot_logs(get_settings(), instances)
+def snapshot_logs(
+    instances: list[str] | None = None,
+    application_logs_fetch_url: str | None = None,
+) -> str:
+    """Download logs once via the configured backend and return a snapshot_id handle.
+
+    For the ``anypoint`` backend, ``application_logs_fetch_url`` (the CloudHub log-file URL,
+    normally read from the suite sheet) is required.
+    """
+    return _logs.snapshot_logs(
+        get_settings(), instances, application_logs_fetch_url=application_logs_fetch_url
+    )
 
 
 @mcp.tool
@@ -134,6 +143,23 @@ def run_and_record(suite_path: str, retain_snapshots: bool = False) -> dict[str,
     """
     report, run_at = _orchestrate.run_and_record(suite_path, retain_snapshots)
     return {"run_at": run_at, "report": report}
+
+
+@mcp.tool
+def generate_and_run(
+    spec_path: str, output_path: str | None = None, retain_snapshots: bool = False
+) -> dict[str, Any]:
+    """Generate a suite from an OpenAPI YAML spec AND run+record it end-to-end, in one call.
+
+    Equivalent to ``generate_test_suite`` followed by ``run_and_record`` on the generated file.
+    The generated suite's ``application_logs_fetch_url`` is auto-filled from
+    ``deployments_base_url`` (.env) + the deployment id in the spec's server description, so
+    CloudHub log validation works without a manual edit. Returns the generation ``summary`` plus
+    the ``run_at`` timestamp and the aggregate ``report``.
+    """
+    summary = _suite_generator.generate_test_suite(spec_path, output_path)
+    report, run_at = _orchestrate.run_and_record(summary["output_path"], retain_snapshots)
+    return {"summary": summary, "run_at": run_at, "report": report}
 
 
 def main() -> None:

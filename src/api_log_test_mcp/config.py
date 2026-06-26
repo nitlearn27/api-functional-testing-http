@@ -13,12 +13,16 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Credentials + the deployments base URL. The per-suite log-fetch URL is read from the test
+# sheet, not from .env; ``deployments_base_url`` is the ".../deployments" base that
+# generate_test_suite appends "/<deployment-id>" to (the id comes from the spec's server
+# description) to build that per-suite URL.
 _ANYPOINT_KEYS = (
-    "application_logs_fetch_url",
     "token_endpoint",
     "client_id",
     "client_secret",
     "grant_type",
+    "deployments_base_url",
 )
 
 
@@ -68,10 +72,13 @@ class Settings(BaseSettings):
 
 
 class AnypointSettings(BaseSettings):
-    """Anypoint platform credentials + log URL.
+    """Anypoint platform credentials (+ the log URL, injected from the suite at runtime).
 
-    These are read **without** the ``ALT_`` prefix because the user's ``.env`` uses the plain
-    lowercase key names below. Secrets live only here (from env/.env), never in the test sheet.
+    Credentials are read **without** the ``ALT_`` prefix because the user's ``.env`` uses the
+    plain lowercase key names below. Secrets live only here (from env/.env), never in the test
+    sheet. ``application_logs_fetch_url`` is **not** read from env — it is populated per run from
+    the suite sheet's metadata (see ``tools/logs.build_log_source``); the default ``None`` here
+    just keeps the field on the model.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -81,6 +88,10 @@ class AnypointSettings(BaseSettings):
     client_id: str | None = None
     client_secret: str | None = None
     grant_type: str = "client_credentials"
+    # The CloudHub deployments base (".../environments/<ENV>/deployments"); generate_test_suite
+    # appends "/<deployment-id>" parsed from the spec's server description to build the per-suite
+    # application_logs_fetch_url. Read from .env, not from the sheet.
+    deployments_base_url: str | None = None
 
 
 def get_settings() -> Settings:

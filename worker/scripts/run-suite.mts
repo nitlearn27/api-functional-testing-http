@@ -3,7 +3,7 @@
  *
  * Suite source (arg 1) is EITHER:
  *   - a path to a local .xlsx        -> uploaded as file_b64
- *   - "id:<suite_id>"                -> a server-stored suite from generate_test_suite
+ *   - "id:<suite_id>"                -> a server-stored suite from run_schema
  * Arg 2 (optional) is the output results path (default: <source-stem>_results.xlsx next to it,
  * or resources/results.xlsx for an id source).
  *
@@ -22,7 +22,7 @@ let id = 0;
 async function rpc(method: string, params: unknown): Promise<any> {
   const res = await fetch(BASE, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(session ? { "mcp-session-id": session } : {}) },
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(session ? { "mcp-session-id": session } : {}), ...(process.env.MCP_TOKEN ? { Authorization: `Bearer ${process.env.MCP_TOKEN}` } : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
   });
   if (!session) session = res.headers.get("mcp-session-id") ?? "";
@@ -45,11 +45,11 @@ if (source.startsWith("id:")) {
 }
 const outPath = process.argv[3] ?? defaultOut;
 
-await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "run-record", version: "0" } });
+await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "run-suite", version: "0" } });
 
-// run_test_suite both starts the run and (re-called with job_id) reports it. Quick suites
+// run_suite both starts the run and (re-called with job_id) reports it. Quick suites
 // complete inside the first call; log-validation runs return a job_id to keep checking.
-let status: any = await call("run_test_suite", runArg);
+let status: any = await call("run_suite", runArg);
 if (status.error) throw new Error(status.error);
 console.log(`started: job_id=${status.job_id}`);
 if (status.status_url) console.log(`status (check anytime, even after Ctrl-C): ${status.status_url}`);
@@ -59,13 +59,13 @@ if (status.status_url) console.log(`status (check anytime, even after Ctrl-C): $
 const deadline = Date.now() + 15 * 60 * 1000;
 while (status.status !== "complete" && status.status !== "error") {
   if (Date.now() > deadline) {
-    console.log(`\ngiving up locally — the run continues server-side; check ${status.status_url ?? "run_test_suite with the job_id"}`);
+    console.log(`\ngiving up locally — the run continues server-side; check ${status.status_url ?? "run_suite with the job_id"}`);
     process.exit(2);
   }
   const wait = Math.min(Math.max(status.next_check_seconds ?? 5, 2), 60);
   process.stdout.write(`\r  status=${status.status} (${status.detail ?? "..."}) — next check in ${wait}s   `);
   await new Promise((r) => setTimeout(r, wait * 1000));
-  status = await call("run_test_suite", { job_id: status.job_id });
+  status = await call("run_suite", { job_id: status.job_id });
 }
 console.log(`\nfinal: status=${status.status}  run_at=${status.run_at}`);
 if (status.status === "error") throw new Error(status.error);

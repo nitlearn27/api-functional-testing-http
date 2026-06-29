@@ -88,7 +88,12 @@ export function deploymentLogsUrl(spec: Json, base?: string): string | null {
   if (!base) return null;
   const description = String(spec.servers?.[0]?.description ?? "");
   const id = description.match(DEPLOYMENT_ID_RE)?.[0];
-  if (!id) return null;
+  return joinDeploymentUrl(base, id);
+}
+
+/** Join a deployments base and a deployment id into `<base>/<id>` (null when either is missing). */
+export function joinDeploymentUrl(base: string | undefined, id: string | null | undefined): string | null {
+  if (!base || !id) return null;
   return `${base.replace(/\/+$/, "")}/${id}`;
 }
 
@@ -214,11 +219,24 @@ class SuiteBuilder {
       { headers, body: baseline, expected_status: successStatus,
         expected_response: success?.expected, response_match_mode: success?.mode });
 
-    // Query-parameter constraint negatives.
+    // Query-parameter constraint negatives: omit each required one, and violate each value constraint.
     for (const qp of queryParams) {
+      if (qp.required === true) {
+        const others = queryParams.filter((p) => p.name !== qp.name && p.required === true);
+        this.add("query_validation", `${name} — missing required query '${qp.name}' → 400`, method,
+          baseUrl + validQueryString(others),
+          { headers, body: baseline, expected_status: 400, expected_response: this.errorExpected(400) });
+      }
       for (const [label, value] of schemaNegatives(qp.name, qp.schema)) {
+        const qParams: Record<string, unknown> = {};
+        for (const p of queryParams) {
+          if (p.required === true) {
+            qParams[p.name] = validValue(p.schema);
+          }
+        }
+        qParams[qp.name] = value;
         this.add("query_validation", `${name} — ${label} → 400`, method,
-          baseUrl + "?" + urlencode({ [qp.name]: value }),
+          baseUrl + "?" + urlencode(qParams),
           { headers, body: baseline, expected_status: 400, expected_response: this.errorExpected(400) });
       }
     }
@@ -497,7 +515,7 @@ function quote(s: string): string {
 
 // --- sheet writing ---------------------------------------------------------------------
 
-function writeSheet(basePath: string | null, cases: TestCase[], logsFetchUrl?: string | null): Uint8Array {
+export function writeSheet(basePath: string | null, cases: TestCase[], logsFetchUrl?: string | null): Uint8Array {
   const aoa: unknown[][] = [
     ["Basepath", basePath ?? ""],
     // CloudHub log-fetch URL — auto-filled from deployments_base_url + the spec's deployment id

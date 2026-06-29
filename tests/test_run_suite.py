@@ -70,3 +70,31 @@ def test_run_suite_reports_failure(tmp_path, monkeypatch):
     assert report.passed == 0
     assert report.failed == 2
     assert all(not c.passed for c in report.cases)
+
+
+def test_run_and_record_writes_separate_results_file(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+
+    client = httpx.Client(transport=httpx.MockTransport(_mock_handler))
+    monkeypatch.setattr(
+        orchestrate, "call_api", functools.partial(real_call_api, client=client)
+    )
+
+    suite_path = _make_suite(tmp_path)
+    suite_bytes_before = Path(suite_path).read_bytes()
+
+    report, run_at, results_path = orchestrate.run_and_record(suite_path)
+
+    assert report.total == 2 and report.passed == 2
+    # Results land in a SEPARATE <stem>_results.xlsx, never the suite.
+    assert results_path == str(tmp_path / "suite_results.xlsx")
+    assert Path(results_path).exists()
+    # The suite file itself is left byte-for-byte unchanged.
+    assert Path(suite_path).read_bytes() == suite_bytes_before
+    # The results file carries the case definitions plus a RESULTS block and per-case tabs.
+    wb = load_workbook(results_path)
+    data_ws = wb.worksheets[0]
+    firsts = [str(r[0]) for r in data_ws.iter_rows(values_only=True) if r and r[0] is not None]
+    assert "TC-001" in firsts
+    assert any(f.startswith("RESULTS") for f in firsts)
+    assert "TC-001" in wb.sheetnames  # evidence tab

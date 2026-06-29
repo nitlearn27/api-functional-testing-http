@@ -53,6 +53,11 @@ def call_api(
     client = client or httpx.Client(timeout=timeout)
     try:
         response = client.request(method.upper(), url, **kwargs)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        # Nothing listening / host unreachable — surface it plainly so a down app reads as such.
+        raise ApiCallError(
+            f"App not running / unreachable at {url} ({type(exc).__name__}: {exc})"
+        ) from exc
     except httpx.HTTPError as exc:
         raise ApiCallError(f"{type(exc).__name__}: {exc}") from exc
     finally:

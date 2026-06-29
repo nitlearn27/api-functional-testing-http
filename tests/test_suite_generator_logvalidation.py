@@ -1,7 +1,7 @@
-"""Generated suites default validate_logs=Yes and assert APIkit router error types.
+"""Generated suites default validate_logs=No (logs deferred) but still populate the log strings.
 
-Offline. Uses a /products POST spec (the Python builder is /products-specific) so it emits the
-body-validation (400) and wrong-content-type (415) cases that carry the APIkit error strings.
+Offline. Uses a small /products POST spec so it emits the body-validation (400) and
+wrong-content-type (415) cases that carry the APIkit error strings.
 """
 
 from __future__ import annotations
@@ -55,7 +55,9 @@ def test_generated_cases_default_log_validation(tmp_path: Path):
     generate_test_suite(str(spec_path), str(out))
 
     suite = read_test_suite(str(out))
-    assert all(c.validate_logs for c in suite.cases)
+    # Logs are deferred: validate_logs is No on every generated case (a run is responses-only)...
+    assert all(not c.validate_logs for c in suite.cases)
+    # ...but the expected log strings are still populated so logs can be switched on later.
 
     by_status = {c.expected_status: c for c in suite.cases}
     assert by_status[400].expected_log_strings == ["APIKIT:BAD_REQUEST"]

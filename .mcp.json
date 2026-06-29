@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "api-log-test": {
-      "type": "http",
-      "url": "https://api-log-test-worker.nit4infy1.workers.dev/mcp",
-      "headers": {
-        "Authorization": "Bearer ${API_LOG_TEST_TOKEN}"
-      }
+      "command": "uv",
+      "args": ["run", "fastmcp", "run", "-m", "api_log_test_mcp.server:mcp"]
     }
   }
 }

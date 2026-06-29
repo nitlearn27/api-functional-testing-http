@@ -14,9 +14,11 @@ Flags gate the credentialed work: ``auth_required=no`` -> no OAuth token; ``vali
 
 from __future__ import annotations
 
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import Settings, get_settings
 from ..models import ApiResponse, CaseEvidence, CaseReport, SuiteReport, TestCase
@@ -52,17 +54,36 @@ def run_suite(suite_path: str, retain_snapshots: bool = False) -> SuiteReport:
     return report
 
 
-def run_and_record(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, str]:
-    """Run the suite, append a timestamped results block, and write per-case evidence tabs.
+def run_and_record(
+    suite_path: str, retain_snapshots: bool = False, results_path: str | None = None
+) -> tuple[SuiteReport, str, str]:
+    """Run the suite and record results into a SEPARATE ``<stem>_results.xlsx`` file.
 
-    Use this (rather than bare ``run_suite``) so every test run is recorded into the sheet:
-    the stacked ``RESULTS`` summary block (appended) plus one overwrite-in-place evidence tab
-    per case (latest run only).
+    Use this (rather than bare ``run_suite``) so every test run is recorded. The **suite file is
+    never modified** — results are written to a sibling results workbook (``results_path`` if
+    given, else ``_results_path(suite_path)``). The results file is cloned from the suite on first
+    use (so it carries the case definitions), then each run appends a timestamped ``RESULTS``
+    summary block and overwrites the per-case evidence tabs (latest run only). Returns
+    ``(report, run_at, results_path)``.
     """
     report, evidence = _run(suite_path, retain_snapshots)
-    run_at = write_results(suite_path, report)
-    write_evidence_tabs(suite_path, evidence, run_at)
-    return report, run_at
+    out = Path(results_path) if results_path else _results_path(suite_path)
+    if not out.exists():
+        shutil.copy2(suite_path, out)  # seed the results file with the suite's case definitions
+    run_at = write_results(str(out), report)
+    write_evidence_tabs(str(out), evidence, run_at)
+    return report, run_at, str(out)
+
+
+def _results_path(suite_path: str) -> Path:
+    """Sibling results workbook for ``suite_path``: ``<stem>_results<suffix>``.
+
+    A trailing ``_suite`` in the stem is replaced (so ``foo_suite.xlsx`` -> ``foo_results.xlsx``);
+    otherwise ``_results`` is appended (``foo.xlsx`` -> ``foo_results.xlsx``).
+    """
+    p = Path(suite_path)
+    stem = p.stem[: -len("_suite")] if p.stem.endswith("_suite") else p.stem
+    return p.with_name(f"{stem}_results{p.suffix}")
 
 
 def _run(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, list[CaseEvidence]]:

@@ -9,7 +9,7 @@ set -euo pipefail
 ENV_FILE="${1:-../.env}"
 [ -f "$ENV_FILE" ] || { echo "no .env found at $ENV_FILE" >&2; exit 1; }
 
-for key in application_logs_fetch_url token_endpoint client_id client_secret grant_type; do
+for key in application_logs_fetch_url token_endpoint client_id client_secret grant_type deployments_base_url; do
   val=$(grep -E "^${key}[[:space:]]*[=:]" "$ENV_FILE" | head -1 \
         | sed -E "s/^${key}[[:space:]]*[=:][[:space:]]*//" | tr -d '\r')
   if [ -n "$val" ]; then

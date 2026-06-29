@@ -3,13 +3,17 @@
 The inverse of ``read_test_suite``: instead of parsing a hand-written sheet into ``TestCase``
 objects, this reads an OpenAPI 3.0 YAML spec and emits a sheet in the exact format the parser
 understands (worksheet ``tests``; a ``Basepath`` metadata row; the canonical header row; one row
-per case). Coverage is comprehensive — a positive case per operation plus one negative case per
-validation rule (required / pattern / enum / length / numeric bounds / array rules), plus
-query-param, path-param, wrong-content-type, malformed-body, not-found and auth cases.
+per case). It walks **every** path × method generically (no fixed/hard-coded paths). Coverage is
+comprehensive — a positive case per operation plus one negative per validation rule (required /
+pattern / enum / length / numeric bounds / array rules), including **query-param and header-param**
+coverage (required ones sent on the happy path; omitting or violating them yields a 400), plus
+path-param, wrong-content-type, malformed-body, not-found and auth cases.
 
-Validation rules are read generically from the resolved schemas (not hard-coded per field), so the
-same logic generalizes to other specs. The generated sheet round-trips through ``read_test_suite``
-with no parse errors, so it can be run immediately by ``run_and_record``.
+``create_test_suite_from_application`` builds on this generator: it combines the app's flow logic
+(base path, branches, DataWeave responses, loggers, error-handler) with the bundled OpenAPI schema
+(valid request structures + validation negatives), going into each flow for accurate expected
+responses. Both write the same sheet format, which round-trips through ``read_test_suite`` with no
+parse errors, so it runs immediately via ``run_test_suite``.
 """
 
 from __future__ import annotations
@@ -25,7 +29,8 @@ import yaml
 from openpyxl import Workbook
 
 from ..config import get_anypoint_settings
-from ..models import MatchMode, TestCase
+from ..models import LogMatchMode, MatchMode, TestCase
+from .mule_app import MuleApp, locate_oas, parse_mule_app
 
 # Wildcard sentinel honoured by the response matcher (field must exist, value not compared).
 ANY = "<<any>>"
@@ -39,15 +44,31 @@ BODY_VALIDATION_STATUS = 400
 
 # Sheet header order — mirrors the hand-written sample and the parser's COLUMNS.
 SHEET_COLUMNS = [
-    "test_id", "description", "method", "url", "headers", "body", "auth_required",
-    "expected_status", "expected_response", "response_match_mode", "validate_logs",
-    "expected_log_strings", "log_match_mode", "log_source",
+    "test_id",
+    "description",
+    "method",
+    "url",
+    "headers",
+    "body",
+    "auth_required",
+    "expected_status",
+    "expected_response",
+    "response_match_mode",
+    "validate_logs",
+    "expected_log_strings",
+    "log_match_mode",
+    "log_source",
 ]
 
 # HTTP reason phrases used to build json_subset error expectations.
 REASON = {
-    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
-    409: "Conflict", 415: "Unsupported Media Type", 422: "Unprocessable Entity",
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    409: "Conflict",
+    415: "Unsupported Media Type",
+    422: "Unprocessable Entity",
 }
 
 # Standard error types the Mulesoft APIkit Router raises, by HTTP status. Used as the default
@@ -108,6 +129,287 @@ def generate_test_suite(spec_path: str, output_path: str | None = None) -> dict[
     }
 
 
+def create_test_suite_from_application(
+    app_root: str, output_path: str | None = None
+) -> dict[str, Any]:
+    """Read a Mule app folder + its bundled OpenAPI schema and write a comprehensive .xlsx suite.
+
+    Combines, going into each flow: schema-driven coverage with **valid request structures** (the
+    spec's example body + required query params/headers, plus query/header/body validation
+    negatives) AND the flow's own logic — base path, the DataWeave success response (exact mock
+    values) + entry/exit loggers on success cases, the error-handler's actual ``{message}`` body on
+    error cases, a case per ``choice`` branch, and the framework error mappings (404/405/406) the
+    schema doesn't model. The schema is extracted from ``target/repository/**/*-oas.zip`` (``~/.m2``
+    fallback); without one it falls back to flow-only cases. ``output_path`` defaults to
+    ``<app-name>_suite.xlsx``. Returns ``output_path``/``base_path``/``oas_used``/``case_count``/
+    ``cases_by_category``.
+    """
+    app = parse_mule_app(app_root)
+    oas_path = locate_oas(app_root)
+    if oas_path is not None:
+        spec = yaml.safe_load(Path(oas_path).read_text())
+        builder = _SuiteBuilder(spec, mule_app=app)
+        builder.build()
+        cases, categories = builder.cases, builder.categories
+        extra_cases, extra_cats = _framework_error_cases(app, spec)
+        cases.extend(extra_cases)
+        for category, count in extra_cats.items():
+            categories[category] = categories.get(category, 0) + count
+        for i, case in enumerate(cases, 1):  # renumber after appending the framework cases
+            case.test_id = f"TC-{i:03d}"
+    else:
+        cases, categories = _flow_cases(app)
+
+    out = (
+        Path(output_path)
+        if output_path
+        else Path(app_root) / f"{Path(app_root).resolve().name}_suite.xlsx"
+    )
+    _write_sheet(out, app.base_path, cases, None)
+    return {
+        "output_path": str(out),
+        "base_path": app.base_path,
+        "oas_used": str(oas_path) if oas_path else None,
+        "case_count": len(cases),
+        "cases_by_category": categories,
+    }
+
+
+def _framework_error_cases(
+    app: MuleApp, spec: dict[str, Any]
+) -> tuple[list[TestCase], dict[str, int]]:
+    """APIkit framework error cases the OpenAPI schema does not model (404 unknown / 405 / 406).
+
+    Each asserts the app's actual ``{message: …}`` body + the ``APIKIT:*`` error. The 406 case sends
+    a schema-valid request (required query params) plus an unsatisfiable ``Accept`` so it reaches
+    the not-acceptable check instead of failing query validation first.
+    """
+    cases: list[TestCase] = []
+    cats: dict[str, int] = {}
+
+    def mk(
+        category: str,
+        desc: str,
+        method: str,
+        url: str,
+        status: int,
+        logs: list[str],
+        headers: dict[str, Any] | None = None,
+    ) -> None:
+        env = app.error_envelope.get(status)
+        cases.append(
+            TestCase(
+                test_id="TC-000",
+                description=desc,
+                method=method,
+                url=url,
+                headers=headers or {},
+                auth_required=False,
+                expected_status=status,
+                expected_response=dict(env) if env else None,
+                response_match_mode=MatchMode.JSON_SUBSET if env else MatchMode.STATUS_ONLY,
+                validate_logs=False,
+                expected_log_strings=logs,
+            )
+        )
+        cats[category] = cats.get(category, 0) + 1
+
+    get_paths = [p for m, p in app.endpoints if m == "GET"]
+    if 404 in app.error_envelope:
+        mk(
+            "not_found",
+            "GET /__nonexistent__ — unknown resource → 404",
+            "GET",
+            "/__nonexistent__",
+            404,
+            ["APIKIT:NOT_FOUND"],
+        )
+    if 405 in app.error_envelope and app.endpoints:
+        path = app.endpoints[0][1]
+        used = {m for m, p in app.endpoints if p == path}
+        unused = next((m for m in ("DELETE", "PUT", "PATCH") if m not in used), "DELETE")
+        mk(
+            "method_not_allowed",
+            f"{unused} {path} — method not allowed → 405",
+            unused,
+            path,
+            405,
+            ["APIKIT:METHOD_NOT_ALLOWED"],
+        )
+    if 406 in app.error_envelope and get_paths:
+        url = _valid_get_url(spec, get_paths[0])
+        mk(
+            "not_acceptable",
+            f"GET {get_paths[0]} — Accept application/xml → 406",
+            "GET",
+            url,
+            406,
+            ["APIKIT:NOT_ACCEPTABLE"],
+            headers={"Accept": "application/xml"},
+        )
+    return cases, cats
+
+
+def _valid_get_url(spec: dict[str, Any], path: str) -> str:
+    """``path`` with required path/query params filled from the spec (so the request is valid)."""
+    op = spec.get("paths", {}).get(path, {}).get("get", {})
+    params = [{**p, "schema": _deref(spec, p.get("schema", {}))} for p in op.get("parameters", [])]
+    path_params = [p for p in params if p.get("in") == "path"]
+    query_params = [p for p in params if p.get("in") == "query"]
+    return _apply_path_params(path, path_params) + _valid_query_string(query_params)
+
+
+def _flow_cases(app: MuleApp) -> tuple[list[TestCase], dict[str, int]]:
+    """Build cases from the Mule flow logic alone — endpoints, branches, responses, error-handler.
+
+    No schema is consulted: request bodies are minimal/branch-triggering, the success status is the
+    HTTP convention (GET→200, create→201; the flow sets no explicit status), the success body is the
+    flow's own DataWeave output, and the error cases come from the global error-handler's mappings.
+    """
+    cases: list[TestCase] = []
+    cats: dict[str, int] = {}
+    counter = 0
+
+    def add(
+        category: str,
+        description: str,
+        method: str,
+        url: str,
+        status: int,
+        logs: list[str],
+        *,
+        body: Any = None,
+        headers: dict[str, Any] | None = None,
+        expected: Any = None,
+    ) -> None:
+        nonlocal counter
+        counter += 1
+        cases.append(
+            TestCase(
+                test_id=f"TC-{counter:03d}",
+                description=description,
+                method=method,
+                url=url,
+                headers=headers or {},
+                body=body,
+                auth_required=False,
+                expected_status=status,
+                expected_response=expected,
+                response_match_mode=MatchMode.JSON_SUBSET
+                if expected is not None
+                else MatchMode.STATUS_ONLY,
+                validate_logs=False,
+                expected_log_strings=logs,
+                log_match_mode=LogMatchMode.ALL_OF if len(logs) > 1 else LogMatchMode.CONTAINS,
+            )
+        )
+        cats[category] = cats.get(category, 0) + 1
+
+    # Positive case(s) per endpoint: one per choice branch, else one plain — asserting the flow's
+    # DataWeave response + its entry/exit loggers (and the branch logger for branch cases).
+    for method, path in app.endpoints:
+        status = 201 if method == "POST" else 200
+        loggers = app.flow_loggers.get((method, path), [])
+        response = app.flow_responses.get((method, path)) or None
+        json_body = method in ("POST", "PUT", "PATCH")
+        headers = dict(JSON_HEADERS) if json_body else None
+        branches = [b for b in app.branches if (b.method, b.path) == (method, path)]
+        if branches:
+            for b in branches:
+                if b.field is not None:
+                    body, label = {b.field: b.value}, f"{b.field}='{b.value}' branch"
+                else:
+                    body, label = {}, "otherwise branch"  # empty payload → equality whens are false
+                add(
+                    "branch_logic",
+                    f"{method} {path} — {label} → {status}",
+                    method,
+                    path,
+                    status,
+                    [*loggers, b.logger],
+                    body=body,
+                    headers=headers,
+                    expected=response,
+                )
+        else:
+            add(
+                "positive",
+                f"{method} {path} — valid request → {status}",
+                method,
+                path,
+                status,
+                loggers,
+                body={} if json_body else None,
+                headers=headers,
+                expected=response,
+            )
+
+    # Error-handler cases: one per APIKIT mapping the global error-handler defines (and we can
+    # trigger), asserting the app's actual {message: …} body + the APIKIT error type.
+    env = app.error_envelope
+    get_paths = [p for m, p in app.endpoints if m == "GET"]
+    post_paths = [p for m, p in app.endpoints if m == "POST"]
+    if 404 in env:
+        add(
+            "not_found",
+            "GET /__nonexistent__ — unknown resource → 404",
+            "GET",
+            "/__nonexistent__",
+            404,
+            ["APIKIT:NOT_FOUND"],
+            expected=dict(env[404]),
+        )
+    if 405 in env and app.endpoints:
+        path = app.endpoints[0][1]
+        used = {m for m, p in app.endpoints if p == path}
+        unused = next((m for m in ("DELETE", "PUT", "PATCH") if m not in used), "DELETE")
+        add(
+            "method_not_allowed",
+            f"{unused} {path} — method not allowed → 405",
+            unused,
+            path,
+            405,
+            ["APIKIT:METHOD_NOT_ALLOWED"],
+            expected=dict(env[405]),
+        )
+    if 406 in env and get_paths:
+        add(
+            "not_acceptable",
+            f"GET {get_paths[0]} — Accept application/xml → 406",
+            "GET",
+            get_paths[0],
+            406,
+            ["APIKIT:NOT_ACCEPTABLE"],
+            headers={"Accept": "application/xml"},
+            expected=dict(env[406]),
+        )
+    if 415 in env and post_paths:
+        add(
+            "media_type",
+            f"POST {post_paths[0]} — wrong Content-Type text/plain → 415",
+            "POST",
+            post_paths[0],
+            415,
+            ["APIKIT:UNSUPPORTED_MEDIA_TYPE"],
+            body="plain text",
+            headers={"Content-Type": "text/plain"},
+            expected=dict(env[415]),
+        )
+    if 400 in env and post_paths:
+        add(
+            "bad_request",
+            f"POST {post_paths[0]} — malformed JSON body → 400",
+            "POST",
+            post_paths[0],
+            400,
+            ["APIKIT:BAD_REQUEST"],
+            body='{"broken": }',
+            headers=dict(JSON_HEADERS),
+            expected=dict(env[400]),
+        )
+    return cases, cats
+
+
 _DEPLOYMENT_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -135,13 +437,17 @@ def _deployment_logs_url(spec: dict[str, Any], base: str | None) -> str | None:
 class _SuiteBuilder:
     """Walks the spec's operations and accumulates TestCases plus per-category counts."""
 
-    def __init__(self, spec: dict[str, Any]) -> None:
+    def __init__(self, spec: dict[str, Any], mule_app: MuleApp | None = None) -> None:
         self.spec = spec
         self.base_path = _base_path(spec)
         self.error_schema = _error_schema(spec)
         self.cases: list[TestCase] = []
         self.categories: dict[str, int] = {}
         self._n = 0
+        # From-application path: overlay each operation's cases with the app's real flow facts
+        # (DataWeave response + loggers on success, the {message} envelope on errors) and add a
+        # case per choice branch. None for the pure schema tool.
+        self.mule_app = mule_app
 
     def _error_expected(self, code: int) -> dict[str, Any]:
         """json_subset expectation for the spec's standard error envelope.
@@ -187,10 +493,14 @@ class _SuiteBuilder:
         if schema.get("type") == "array":
             return _array_any_template(self.spec, schema), MatchMode.JSON_SUBSET
         # Object success body: assert existence (<<any>>) of only the schema's *declared* required
-        # fields — never optional ones. ``echo`` overlays concrete request values (create cases).
+        # fields — never optional ones. ``echo`` overlays concrete request values, but only for
+        # fields the *response* schema actually declares — so a create endpoint whose response is a
+        # different shape (e.g. {patientId, message} rather than the echoed payload) isn't asserted
+        # to contain request fields it never returns.
         node: dict[str, Any] = {field: ANY for field in schema.get("required", [])}
         if echo:
-            node.update(echo)
+            props = schema.get("properties", {})
+            node.update({k: v for k, v in echo.items() if k in props})
         if node:
             return node, MatchMode.JSON_SUBSET
         # No declared required fields (and nothing echoed): accept any object body with <<any>>,
@@ -235,10 +545,10 @@ class _SuiteBuilder:
                 expected_status=expected_status,
                 expected_response=expected_response,
                 response_match_mode=response_match_mode,
-                # Validate logs on every case so each run exercises both the API and the CloudHub
-                # log endpoint; error cases assert the APIkit router's error type, 2xx/401 assert
-                # nothing specific (still fetched, so a missing/blank log endpoint surfaces).
-                validate_logs=True,
+                # Logs are deferred for now: validate_logs defaults to No so a run is responses-only
+                # (no log phase). The expected log strings are still populated so log validation can
+                # be switched on later by flipping the column (or by the from-application enricher).
+                validate_logs=False,
                 expected_log_strings=_expected_log_strings(expected_status, method, url),
                 log_source="anypoint",
             )
@@ -246,176 +556,299 @@ class _SuiteBuilder:
         self.categories[category] = self.categories.get(category, 0) + 1
 
     def build(self) -> None:
-        paths = self.spec.get("paths", {})
-        if "/products" in paths:
-            self._build_list(paths["/products"].get("get"))
-            self._build_create(paths["/products"].get("post"))
-        if "/products/{name}" in paths:
-            self._build_get_by_name(paths["/products/{name}"].get("get"))
+        """Walk every path × method generically (works for any spec, not a fixed set of paths)."""
+        methods = ("get", "post", "put", "patch", "delete")
+        for path, item in (self.spec.get("paths") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            for method in methods:
+                op = item.get(method)
+                if isinstance(op, dict):
+                    self._build_operation(path, method.upper(), op)
 
-    def _build_list(self, op: dict[str, Any] | None) -> None:
-        if not op:
-            return
+    def _build_operation(self, path: str, method: str, op: dict[str, Any]) -> None:
+        """Per-operation coverage: a positive case plus one negative per validation rule.
+
+        Covers query params, **header params**, path params, request-body rules, wrong content
+        type, not-found and auth — all read generically from the operation's declared parameters
+        and schemas. Required query params and headers are sent on the positive case; omitting a
+        required one (or violating its constraints) yields a 400 negative.
+        """
+        params = [
+            {**p, "schema": _deref(self.spec, p.get("schema", {}))}
+            for p in op.get("parameters", [])
+        ]
+        path_params = [p for p in params if p.get("in") == "path"]
+        query_params = [p for p in params if p.get("in") == "query"]
+        header_params = [p for p in params if p.get("in") == "header"]
+        responses = op.get("responses", {})
+        success_status = _first_status(responses, "2") or 200
+        has_json_body = bool(op.get("requestBody", {}).get("content", {}).get("application/json"))
+        secured = _nonempty(op.get("security", self.spec.get("security")))
+        name = str(op.get("summary") or op.get("operationId") or f"{method} {path}")
+        start = len(self.cases)  # for the from-application overlay at the end
+
+        base_url = _apply_path_params(path, path_params)
+        query = _valid_query_string(query_params)
+        pos_url = base_url + query
+        # Required headers are sent on every case (plus Content-Type when there's a JSON body).
+        required_headers = {
+            h["name"]: _valid_value(h["schema"]) for h in header_params if h.get("required")
+        }
+
+        baseline: Any = None
+        headers: dict[str, Any] = dict(required_headers)
+        if has_json_body:
+            schema, example = self._request_body(op)
+            baseline = copy.deepcopy(example) if example else _sample_value(self.spec, schema)
+            headers.update(JSON_HEADERS)
+        echo = (
+            copy.deepcopy(baseline)
+            if baseline is not None and method in ("POST", "PUT", "PATCH")
+            else None
+        )
+
+        # Positive case (first documented 2xx), sending required query params + headers.
         self._add(
             "positive",
-            "List products — valid pagination → 200",
-            "GET",
-            "/products?" + urlencode({"page": 1, "pageSize": 20, "sortBy": "price"}),
-            expected_status=200,
-            **self._success_kwargs(op),
+            f"{name} — valid request → {success_status}",
+            method,
+            pos_url,
+            headers=headers or None,
+            body=baseline,
+            expected_status=success_status,
+            **self._success_kwargs(op, echo=echo),
         )
-        for param in op.get("parameters", []):
-            if param.get("in") != "query":
-                continue
-            name = param["name"]
-            schema = _deref(self.spec, param.get("schema", {}))
-            for label, value in _schema_negatives(name, schema):
+
+        # Query-param negatives: omit each required one, and violate each value constraint → 400.
+        for qp in query_params:
+            if qp.get("required"):
+                others = [p for p in query_params if p["name"] != qp["name"] and p.get("required")]
                 self._add(
                     "query_validation",
-                    f"List products — {label} → 400",
-                    "GET",
-                    "/products?" + urlencode({name: value}),
+                    f"{name} — missing required query '{qp['name']}' → 400",
+                    method,
+                    base_url + _valid_query_string(others),
+                    headers=headers or None,
+                    body=baseline,
                     expected_status=400,
                     expected_response=self._error_expected(400),
                 )
-        self._add(
-            "auth",
-            "List products — invalid credentials → 401 (requires API auth enforced)",
-            "GET",
-            "/products",
-            headers={"Authorization": "Bearer invalid-token"},
-            expected_status=401,
-            expected_response=self._error_expected(401),
-        )
+            for label, value in _schema_negatives(qp["name"], qp["schema"]):
+                q_dict = {
+                    p["name"]: _valid_value(p["schema"]) for p in query_params if p.get("required")
+                }
+                q_dict[qp["name"]] = value
+                self._add(
+                    "query_validation",
+                    f"{name} — {label} → 400",
+                    method,
+                    base_url + "?" + urlencode(q_dict),
+                    headers=headers or None,
+                    body=baseline,
+                    expected_status=400,
+                    expected_response=self._error_expected(400),
+                )
 
-    def _build_create(self, op: dict[str, Any] | None) -> None:
-        if not op:
-            return
-        schema, example = self._request_body(op)
-        baseline = copy.deepcopy(example) if example else _sample_value(self.spec, schema)
-        required = schema.get("required", [])
+        # Header-param negatives: omit each required header, and violate each constraint → 400.
+        for hp in header_params:
+            if hp.get("required"):
+                without = {k: v for k, v in headers.items() if k != hp["name"]}
+                self._add(
+                    "header_validation",
+                    f"{name} — missing required header '{hp['name']}' → 400",
+                    method,
+                    pos_url,
+                    headers=without or None,
+                    body=baseline,
+                    expected_status=400,
+                    expected_response=self._error_expected(400),
+                )
+            for label, value in _schema_negatives(hp["name"], hp["schema"]):
+                bad = dict(headers)
+                bad[hp["name"]] = value
+                self._add(
+                    "header_validation",
+                    f"{name} — header {label} → 400",
+                    method,
+                    pos_url,
+                    headers=bad,
+                    body=baseline,
+                    expected_status=400,
+                    expected_response=self._error_expected(400),
+                )
 
-        self._add(
-            "positive",
-            "Create product — valid payload → 201",
-            "POST",
-            "/products",
-            headers=dict(JSON_HEADERS),
-            body=baseline,
-            expected_status=201,
-            **self._success_kwargs(op, echo=copy.deepcopy(baseline)),
-        )
+        # Path-param constraint negatives.
+        for pp in path_params:
+            for label, value in _schema_negatives(pp["name"], pp["schema"]):
+                self._add(
+                    "path_validation",
+                    f"{name} — {label} → 400",
+                    method,
+                    _apply_path_params(path, path_params, {pp["name"]: str(value)}) + query,
+                    headers=headers or None,
+                    body=baseline,
+                    expected_status=400,
+                    expected_response=self._error_expected(400),
+                )
 
-        # All request-body validation failures are expected as 400 Bad Request. The spec
-        # documents 422 (Unprocessable Entity) for field-level errors, but the Mulesoft
-        # implementation cannot produce 422, so the suite folds every body-validation
-        # scenario (missing field, bad pattern/enum/length/bounds, array rules, extra field)
-        # into the 400 bucket. See BODY_VALIDATION_STATUS.
-        for field in required:
-            body = copy.deepcopy(baseline)
-            body.pop(field, None)
-            self._add(
-                "body_validation",
-                f"Create product — missing required '{field}' → {BODY_VALIDATION_STATUS}",
-                "POST",
-                "/products",
-                headers=dict(JSON_HEADERS),
-                body=body,
-                expected_status=BODY_VALIDATION_STATUS,
-                expected_response=self._error_expected(BODY_VALIDATION_STATUS),
-            )
-
-        for field, pschema in schema.get("properties", {}).items():
-            pschema = _deref(self.spec, pschema)
-            negs = (
-                _array_negatives(field, pschema)
-                if pschema.get("type") == "array"
-                else _schema_negatives(field, pschema)
-            )
-            for label, value in negs:
+        # Request-body validation negatives (all folded into 400; Mulesoft cannot return 422).
+        if has_json_body and baseline is not None:
+            schema, _ = self._request_body(op)
+            for field in schema.get("required", []):
                 body = copy.deepcopy(baseline)
-                body[field] = value
+                body.pop(field, None)
                 self._add(
                     "body_validation",
-                    f"Create product — {label} → {BODY_VALIDATION_STATUS}",
-                    "POST",
-                    "/products",
+                    f"{name} — missing required '{field}' → {BODY_VALIDATION_STATUS}",
+                    method,
+                    pos_url,
                     headers=dict(JSON_HEADERS),
                     body=body,
                     expected_status=BODY_VALIDATION_STATUS,
                     expected_response=self._error_expected(BODY_VALIDATION_STATUS),
                 )
-
-        if schema.get("additionalProperties") is False:
-            body = copy.deepcopy(baseline)
-            body["unexpectedField"] = "x"
+            for field, pschema in schema.get("properties", {}).items():
+                pschema = _deref(self.spec, pschema)
+                negs = (
+                    _array_negatives(field, pschema)
+                    if pschema.get("type") == "array"
+                    else _schema_negatives(field, pschema)
+                )
+                for label, value in negs:
+                    body = copy.deepcopy(baseline)
+                    body[field] = value
+                    self._add(
+                        "body_validation",
+                        f"{name} — {label} → {BODY_VALIDATION_STATUS}",
+                        method,
+                        pos_url,
+                        headers=dict(JSON_HEADERS),
+                        body=body,
+                        expected_status=BODY_VALIDATION_STATUS,
+                        expected_response=self._error_expected(BODY_VALIDATION_STATUS),
+                    )
+            if schema.get("additionalProperties") is False:
+                body = copy.deepcopy(baseline)
+                body["unexpectedField"] = "x"
+                self._add(
+                    "body_validation",
+                    f"{name} — extra field (additionalProperties:false) → {BODY_VALIDATION_STATUS}",
+                    method,
+                    pos_url,
+                    headers=dict(JSON_HEADERS),
+                    body=body,
+                    expected_status=BODY_VALIDATION_STATUS,
+                    expected_response=self._error_expected(BODY_VALIDATION_STATUS),
+                )
+            # Deliberately malformed JSON, sent verbatim as a raw (non-JSON) cell.
             self._add(
-                "body_validation",
-                "Create product — unexpected extra field (additionalProperties:false) "
-                f"→ {BODY_VALIDATION_STATUS}",
-                "POST",
-                "/products",
+                "bad_request",
+                f"{name} — malformed JSON body → 400",
+                method,
+                pos_url,
                 headers=dict(JSON_HEADERS),
-                body=body,
-                expected_status=BODY_VALIDATION_STATUS,
-                expected_response=self._error_expected(BODY_VALIDATION_STATUS),
-            )
-
-        # Deliberately malformed JSON, sent verbatim as a raw (non-JSON) cell.
-        self._add(
-            "bad_request",
-            "Create product — malformed JSON body → 400",
-            "POST",
-            "/products",
-            headers=dict(JSON_HEADERS),
-            body='{"name": "Broken", "sku": }',
-            expected_status=400,
-            expected_response=self._error_expected(400),
-        )
-
-        self._add(
-            "media_type",
-            "Create product — wrong Content-Type text/plain → 415",
-            "POST",
-            "/products",
-            headers={"Content-Type": "text/plain"},
-            body=baseline,
-            expected_status=415,
-            expected_response=self._error_expected(415),
-        )
-
-    def _build_get_by_name(self, op: dict[str, Any] | None) -> None:
-        if not op:
-            return
-        param = next((p for p in op.get("parameters", []) if p.get("in") == "path"), {})
-        schema = _deref(self.spec, param.get("schema", {}))
-        valid = str(schema.get("example") or "Wireless Bluetooth Headphones").replace("%20", " ")
-
-        self._add(
-            "positive",
-            "Get product by name — existing product → 200",
-            "GET",
-            "/products/" + quote(valid),
-            expected_status=200,
-            **self._success_kwargs(op),
-        )
-        for label, value in _schema_negatives("name", schema):
-            self._add(
-                "path_validation",
-                f"Get product by name — {label} → 400",
-                "GET",
-                "/products/" + quote(str(value)),
+                body='{"broken": }',
                 expected_status=400,
                 expected_response=self._error_expected(400),
             )
-        self._add(
-            "not_found",
-            "Get product by name — nonexistent name → 404",
-            "GET",
-            "/products/" + quote("Quantum Flux Capacitor"),
-            expected_status=404,
-            expected_response=self._error_expected(404),
-        )
+            self._add(
+                "media_type",
+                f"{name} — wrong Content-Type text/plain → 415",
+                method,
+                pos_url,
+                headers={"Content-Type": "text/plain"},
+                body=baseline,
+                expected_status=415,
+                expected_response=self._error_expected(415),
+            )
+
+        # Not-found for a GET addressed by a path parameter.
+        if method == "GET" and path_params:
+            bogus = {p["name"]: "Nonexistent-ZZZ-000" for p in path_params}
+            self._add(
+                "not_found",
+                f"{name} — nonexistent resource → 404",
+                method,
+                _apply_path_params(path, path_params, bogus) + query,
+                headers=headers or None,
+                body=baseline,
+                expected_status=404,
+                expected_response=self._error_expected(404),
+            )
+
+        # Auth negative when the operation (or the API) declares security.
+        if secured:
+            self._add(
+                "auth",
+                f"{name} — invalid credentials → 401",
+                method,
+                pos_url,
+                headers={**headers, "Authorization": "Bearer invalid-token"},
+                body=baseline,
+                expected_status=401,
+                expected_response=self._error_expected(401),
+            )
+
+        # From-application overlay: real flow facts + a case per choice branch.
+        if self.mule_app is not None:
+            self._apply_mule(start, method, path, name, pos_url, headers, baseline, success_status)
+
+    def _apply_mule(
+        self,
+        start: int,
+        method: str,
+        path: str,
+        name: str,
+        pos_url: str,
+        headers: dict[str, Any],
+        baseline: Any,
+        success_status: int,
+    ) -> None:
+        """Overlay this operation's schema-driven cases with the app's real flow facts.
+
+        Going into the flow itself: success (2xx) cases assert the flow's DataWeave response (exact
+        mock values) and entry/exit loggers; error (4xx/5xx) cases assert the error-handler's actual
+        ``{message: …}`` body. A case per ``choice`` branch is added — the schema's valid request
+        body (``baseline``) with the branch field overlaid, asserting that branch's logger. Requests
+        keep the schema-shaped query/header/body so the live API accepts them.
+        """
+        app = self.mule_app
+        assert app is not None
+        loggers = app.flow_loggers.get((method, path), [])
+        flow_resp = app.flow_responses.get((method, path))
+        for case in self.cases[start:]:
+            status = case.expected_status or 0
+            if status < 400:
+                if loggers:
+                    case.expected_log_strings = list(loggers)
+                    case.log_match_mode = LogMatchMode.ALL_OF
+                if flow_resp:
+                    case.expected_response = dict(flow_resp)
+                    case.response_match_mode = MatchMode.JSON_SUBSET
+            elif status in app.error_envelope:
+                case.expected_response = dict(app.error_envelope[status])
+                case.response_match_mode = MatchMode.JSON_SUBSET
+        for b in [br for br in app.branches if (br.method, br.path) == (method, path)]:
+            body = copy.deepcopy(baseline) if isinstance(baseline, dict) else {}
+            if b.field is not None:
+                body[b.field] = b.value  # overlay the branch trigger onto the valid baseline
+                label = f"{b.field}='{b.value}' branch"
+            else:
+                label = "otherwise branch"  # the baseline's own field value falls through to else
+            self._add(
+                "branch_logic",
+                f"{name} — {label} → {success_status}",
+                method,
+                pos_url,
+                headers=headers or None,
+                body=body,
+                expected_status=success_status,
+                expected_response=dict(flow_resp) if flow_resp else None,
+                response_match_mode=MatchMode.JSON_SUBSET,
+            )
+            self.cases[-1].expected_log_strings = [*loggers, b.logger]
+            self.cases[-1].log_match_mode = LogMatchMode.ALL_OF
 
     def _request_body(self, op: dict[str, Any]) -> tuple[dict[str, Any], Any]:
         content = op.get("requestBody", {}).get("content", {}).get("application/json", {})
@@ -431,6 +864,62 @@ def _base_path(spec: dict[str, Any]) -> str | None:
     if servers and servers[0].get("url"):
         return servers[0]["url"]
     return None
+
+
+def _first_status(responses: dict[str, Any], prefix: str) -> int | None:
+    """First response status (as int) whose code starts with ``prefix`` ("2" for success)."""
+    for code in responses:
+        if str(code).startswith(prefix):
+            try:
+                return int(code)
+            except ValueError:
+                return None
+    return None
+
+
+def _nonempty(security: Any) -> bool:
+    return isinstance(security, list) and len(security) > 0
+
+
+def _valid_value(schema: dict[str, Any]) -> Any:
+    """A schema-conformant valid scalar: explicit example, else first enum, else a type default."""
+    if "example" in schema:
+        return str(schema["example"]).replace("%20", " ")
+    if schema.get("enum"):
+        return schema["enum"][0]
+    t = schema.get("type")
+    if t in ("integer", "number"):
+        return schema.get("minimum", 1)
+    if t == "boolean":
+        return True
+    return "sample"
+
+
+def _apply_path_params(
+    path: str, path_params: list[dict[str, Any]], overrides: dict[str, str] | None = None
+) -> str:
+    """Substitute ``{name}`` segments with a valid (or overridden) value, url-quoted."""
+    overrides = overrides or {}
+    by_name = {p["name"]: p for p in path_params}
+
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1)
+        value = (
+            overrides[key]
+            if key in overrides
+            else str(_valid_value(by_name.get(key, {}).get("schema", {})))
+        )
+        return quote(value, safe="")
+
+    return re.sub(r"\{([^}]+)\}", repl, path)
+
+
+def _valid_query_string(query_params: list[dict[str, Any]]) -> str:
+    """Query string of just the required params, each set to a valid value ("" if none)."""
+    required = [p for p in query_params if p.get("required")]
+    if not required:
+        return ""
+    return "?" + urlencode({p["name"]: _valid_value(p["schema"]) for p in required})
 
 
 def _resolve_ref(spec: dict[str, Any], ref: str) -> Any:
@@ -567,8 +1056,7 @@ def _sample_value(spec: dict[str, Any], schema: dict[str, Any]) -> Any:
 def _sample_object(spec: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
     props = schema.get("properties", {})
     return {
-        field: _sample_value(spec, props.get(field, {}))
-        for field in schema.get("required", [])
+        field: _sample_value(spec, props.get(field, {})) for field in schema.get("required", [])
     }
 
 

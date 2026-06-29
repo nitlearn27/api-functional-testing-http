@@ -37,19 +37,24 @@ Job state (suite bytes, per-case runs, per-source retry counter, final report + 
 workbook) lives in the JobRunner DO's SQLite, so a run survives MCP-session loss and DO
 eviction. `run_suite` (with `job_id`) and `GET /jobs/{id}` re-resolve the same DO.
 
-## Tools (exactly two, by design)
+## Tools (three, by design)
 
-Both tools **run** tests; they differ only in the input.
+`run_schema` and `run_suite` **run** tests; `create_test_case_all` only **creates** a suite.
 
 | Tool | Input | Output |
 |------|-------|--------|
 | `run_schema` | `spec_yaml` (OpenAPI 3.0 YAML) to generate-and-run; `job_id` to check | generation summary + `suite_id` + `suite_download_url`, plus the run's report (or `{ job_id, status, … }`) |
 | `run_suite` | `suite_id` OR `file_b64` to start; `job_id` to check | report + `result_download_url` when done, else `{ job_id, status, detail, status_url, next_check_seconds }` |
+| `create_test_case_all` | `cases` (model-analyzed) + optional `base_path`, `application_logs_fetch_url`/`deployment_id` | created-suite summary + `suite_id` + `suite_download_url` (no run) |
 
-`run_schema` generates the suite from the schema **and** runs it in one call. Both wait ~15s
-in-call, so quick suites return their full report immediately; log-validation runs hand back a
-`job_id` — call the same tool again with it (or watch the plain-HTTP `status_url`). The internal
-helpers (parser, matcher, runner) are not exposed as separate tools.
+`create_test_case_all` is for sources that aren't a clean schema — e.g. a MuleSoft app: the
+**model** analyzes the app's flows/logic **and** its OpenAPI schema client-side and sends only the
+distilled cases; the worker just renders them into the `.xlsx` and returns it. It does **not** run
+the tests — run the created suite separately with `run_suite` (or the Python `run_and_record` for a
+local app). See the `analyze-mule` skill. `run_schema`/`run_suite` wait ~15s in-call, so quick
+suites return their full report immediately; log-validation runs hand back a `job_id` — call the
+same tool again with it (or watch the plain-HTTP `status_url`). The internal helpers (parser,
+matcher, runner) are not exposed as separate tools.
 
 ## HTTP endpoints (besides `/mcp`)
 

@@ -61,11 +61,12 @@ async function main() {
   if (!gen.suite_download_url) throw new Error("missing suite_download_url");
   ok(`generated 41 cases, suite_download_url + job_id=${gen.job_id} returned`);
 
-  // 3. exactly the two consolidated tools are exposed
-  if (tools.length !== 2 || !tools.includes("run_schema") || !tools.includes("run_suite")) {
-    throw new Error(`expected exactly [run_schema, run_suite], got: ${tools.join(", ")}`);
+  // 3. exactly the three consolidated tools are exposed
+  const expectedTools = ["run_schema", "run_suite", "create_test_case_all"];
+  if (tools.length !== expectedTools.length || !expectedTools.every((t) => tools.includes(t))) {
+    throw new Error(`expected exactly [${expectedTools.join(", ")}], got: ${tools.join(", ")}`);
   }
-  ok("tool list is exactly the 2 consolidated tools");
+  ok("tool list is exactly the 3 consolidated tools");
 
   // 4. download the suite via the link and parse it locally (round-trip check)
   console.log("\n[download] fetch the link, parse the workbook locally");

@@ -1,7 +1,10 @@
 """FastMCP server entry point.
 
-Registers all nine tools so the contract is fixed early. The no-network core plus the
-end-to-end runners are implemented; ``get_auth_token`` stays a stub until its phase lands.
+Three primary tools: ``create_test_suite_from_schema`` (OpenAPI in → suite),
+``create_test_suite_from_application`` (Mule app folder → suite, reading flows + the bundled
+schema), and ``run_test_suite`` (run a suite .xlsx, write a separate results file). The rest
+(``read_test_suite``, ``call_api``, ``assert_response``, ``snapshot_logs``, ``validate_logs``,
+``run_suite``, ``get_auth_token``) are low-level building blocks the primary tools use.
 """
 
 from __future__ import annotations
@@ -45,15 +48,36 @@ def read_test_suite(path: str) -> TestSuite:
 
 
 @mcp.tool
-def generate_test_suite(spec_path: str, output_path: str | None = None) -> dict[str, Any]:
-    """Generate a runnable .xlsx test suite from an OpenAPI YAML spec.
+def create_test_suite_from_schema(
+    schema_path: str, output_path: str | None = None
+) -> dict[str, Any]:
+    """Create a runnable .xlsx test suite from an OpenAPI 3.0 schema. Does NOT run the tests.
 
-    Builds comprehensive validation coverage (a positive case per operation plus one negative
-    case per validation rule) in the same sheet format ``read_test_suite``/``run_and_record``
-    consume. Returns a summary with ``output_path``, ``base_path``, ``case_count`` and
-    ``cases_by_category``.
+    Walks every path × method and builds comprehensive coverage — a positive case per operation
+    plus one negative per validation rule, including the schema's **query params and header params**
+    (required ones are sent; omitting/violating them yields a 400) and request-body rules. Writes
+    the suite next to the schema as ``<stem>_suite.xlsx`` (or ``output_path``) and returns a summary
+    (``output_path``, ``base_path``, ``case_count``, ``cases_by_category``). Run it with
+    ``run_test_suite``.
     """
-    return _suite_generator.generate_test_suite(spec_path, output_path)
+    return _suite_generator.generate_test_suite(schema_path, output_path)
+
+
+@mcp.tool
+def create_test_suite_from_application(
+    app_root: str, output_path: str | None = None
+) -> dict[str, Any]:
+    """Create a .xlsx test suite from a MuleSoft app's root folder.
+
+    Combines flow logic and OpenAPI schema validation. Reads ``src/main/mule/*.xml`` and builds
+    cases from the flow logic (base path, endpoints, entry/exit loggers, DataWeave responses,
+    choices/branches, and error-handler mappings) and combines them with the bundled OpenAPI
+    schema (query, header, path parameter, and body validations) extracted from
+    ``target/repository/**/*-oas.zip`` or ``~/.m2``. If no schema is found, it falls back to
+    flow-only test cases. Writes ``<app-name>_suite.xlsx`` (or ``output_path``); run it with
+    ``run_test_suite``.
+    """
+    return _suite_generator.create_test_suite_from_application(app_root, output_path)
 
 
 @mcp.tool
@@ -128,38 +152,27 @@ def call_api(
 
 
 @mcp.tool
+def run_test_suite(suite_path: str) -> dict[str, Any]:
+    """Run a test-suite .xlsx against its Basepath and write the results to a separate file.
+
+    The primary run tool. Takes a suite from ``create_test_suite_from_schema`` /
+    ``create_test_suite_from_application`` (optionally hand-edited). Runs on this machine, so it
+    reaches ``localhost`` or any public URL; makes the HTTP calls + response (status/body)
+    assertions. The suite file is never modified — results go to a sibling ``<stem>_results.xlsx``
+    (a timestamped RESULTS block + one evidence tab per case). When the app is unreachable every
+    case reports "App not running". Returns ``report``, ``run_at`` and ``results_path``.
+    """
+    report, run_at, results_path = _orchestrate.run_and_record(suite_path)
+    return {"run_at": run_at, "results_path": results_path, "report": report}
+
+
+@mcp.tool
 def run_suite(suite_path: str, retain_snapshots: bool = False) -> SuiteReport:
-    """Run a full suite end-to-end (call + assert + optional log validation) and emit a report."""
+    """[low-level] Run a suite end-to-end and return the report only (writes no file).
+
+    ``run_test_suite`` is the primary run tool; this is the building block it uses.
+    """
     return _orchestrate.run_suite(suite_path, retain_snapshots)
-
-
-@mcp.tool
-def run_and_record(suite_path: str, retain_snapshots: bool = False) -> dict[str, Any]:
-    """Run a suite end-to-end AND append a timestamped results block to the sheet.
-
-    Prefer this over ``run_suite`` to actually test end-to-end: it makes real HTTP calls,
-    optionally validates logs, and records the outcome back into the suite sheet. Returns the
-    aggregate ``report`` plus the ``run_at`` timestamp of the recorded block.
-    """
-    report, run_at = _orchestrate.run_and_record(suite_path, retain_snapshots)
-    return {"run_at": run_at, "report": report}
-
-
-@mcp.tool
-def generate_and_run(
-    spec_path: str, output_path: str | None = None, retain_snapshots: bool = False
-) -> dict[str, Any]:
-    """Generate a suite from an OpenAPI YAML spec AND run+record it end-to-end, in one call.
-
-    Equivalent to ``generate_test_suite`` followed by ``run_and_record`` on the generated file.
-    The generated suite's ``application_logs_fetch_url`` is auto-filled from
-    ``deployments_base_url`` (.env) + the deployment id in the spec's server description, so
-    CloudHub log validation works without a manual edit. Returns the generation ``summary`` plus
-    the ``run_at`` timestamp and the aggregate ``report``.
-    """
-    summary = _suite_generator.generate_test_suite(spec_path, output_path)
-    report, run_at = _orchestrate.run_and_record(summary["output_path"], retain_snapshots)
-    return {"summary": summary, "run_at": run_at, "report": report}
 
 
 def main() -> None:

@@ -58,3 +58,27 @@ def test_call_api_wraps_transport_errors():
 
     with pytest.raises(ApiCallError):
         call_api("get", "https://unreachable.test/", client=_client(handler))
+
+
+def test_call_api_connection_error_says_app_not_running():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    with pytest.raises(ApiCallError) as exc_info:
+        call_api("get", "http://localhost:8081/api/patients", client=_client(handler))
+
+    message = str(exc_info.value)
+    assert "App not running" in message
+    assert "http://localhost:8081/api/patients" in message
+
+
+def test_call_api_non_connection_error_keeps_plain_message():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with pytest.raises(ApiCallError) as exc_info:
+        call_api("get", "https://api.test/slow", client=_client(handler))
+
+    # A read timeout is not a connection failure, so it should NOT be labelled "App not running".
+    assert "App not running" not in str(exc_info.value)
+    assert "ReadTimeout" in str(exc_info.value)

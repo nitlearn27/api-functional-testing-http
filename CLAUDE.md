@@ -74,9 +74,11 @@ tests/                      # pytest; httpx MockTransport for network; conftest 
   against its `Basepath` and write results to a **separate** `<stem>_results.xlsx`. (`run_and_record`)
 
 Generated cases default `validate_logs=No` (logs deferred); the log strings are still populated so
-log validation can be switched on later. Low-level building blocks stay registered:
-`read_test_suite`, `call_api`, `assert_response`, `snapshot_logs`, `validate_logs`, `run_suite`,
-and the `get_auth_token` stub (only needed when a case sets `auth_required=yes`).
+log validation can be switched on later. These three are the **only** MCP tools exposed. The
+building blocks they call (`tools/suite.read_test_suite`, `tools/http_runner.call_api`,
+`matching/response_matcher.assert_response`, `tools/logs.snapshot_logs`/`validate_logs`,
+`orchestrate.run_suite`, `tools/auth.get_auth_token`) remain importable from their modules but are
+no longer registered as tools.
 
 ## Suite sheet (`.numbers` or `.xlsx`)
 

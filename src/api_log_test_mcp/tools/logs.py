@@ -39,9 +39,26 @@ def resolve_anypoint_logs_url() -> str | None:
 
     # Determine target app name from pom.xml or current directory name
     app_name = None
-    cwd = Path.cwd()
-    pom = cwd / "pom.xml"
-    if pom.exists():
+    import os
+    suite_path = os.environ.get("_CURRENT_SUITE_PATH")
+    pom = None
+
+    if suite_path:
+        # Check folders relative to the test suite file
+        suite_dir = Path(suite_path).parent
+        for folder in [suite_dir, suite_dir.parent]:
+            test_pom = folder / "pom.xml"
+            if test_pom.exists():
+                pom = test_pom
+                break
+
+    if not pom:
+        cwd = Path.cwd()
+        test_pom = cwd / "pom.xml"
+        if test_pom.exists():
+            pom = test_pom
+
+    if pom:
         try:
             tree = ET.parse(pom)
             root = tree.getroot()
@@ -55,7 +72,9 @@ def resolve_anypoint_logs_url() -> str | None:
                     app_name = art_elem.text.strip()
         except Exception:
             pass
+
     if not app_name:
+        cwd = Path.cwd()
         app_name = cwd.name
 
     if not app_name:

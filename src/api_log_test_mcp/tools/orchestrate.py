@@ -88,6 +88,9 @@ def _results_path(suite_path: str) -> Path:
 
 def _run(suite_path: str, retain_snapshots: bool = False) -> tuple[SuiteReport, list[CaseEvidence]]:
     """Run every case and return both the aggregate report and per-case evidence."""
+    import os
+    os.environ["_CURRENT_SUITE_PATH"] = suite_path
+
     suite = read_test_suite(suite_path)
     settings = get_settings()
     report = SuiteReport(parse_errors=suite.parse_errors)

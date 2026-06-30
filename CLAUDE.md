@@ -70,8 +70,11 @@ tests/                      # pytest; httpx MockTransport for network; conftest 
   **NOT** read the OpenAPI schema — that's `create_test_suite_from_schema`'s job (the two are kept
   deliberately separate). Does NOT run.
   (`tools/suite_generator.create_test_suite_from_application` + `tools/mule_app.parse_mule_app`)
-- `run_test_suite(suite_path)` — run a suite (from either create tool, optionally hand-edited)
-  against its `Basepath` and write results to a **separate** `<stem>_results.xlsx`. (`run_and_record`)
+- `run_test_suite(suite_path, job_id)` — run a suite (from either create tool, optionally hand-edited)
+  against its `Basepath` and write results to a **separate** `<stem>_results.xlsx`. Runs asynchronously in
+  the background to prevent Claude Code stdio timeouts. Returns a `job_id` initially; call it again with only the
+  `job_id` to poll progress percentage (e.g. `progress_percent: 34` and `"detail": "Waiting for log propagation..."`).
+  (`run_and_record`)
 
 Generated cases default `validate_logs=No` (logs deferred); the log strings are still populated so
 log validation can be switched on later. These three are the **only** MCP tools exposed. The

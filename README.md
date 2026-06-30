@@ -8,19 +8,16 @@ transaction, and writes timestamped results back into the suite sheet.
 See `api-log-test-mcp-dev-plan.md` for the full phased plan and [`memory/`](memory/) for design
 notes and gotchas.
 
-## Tools
+## Exposed MCP Tools
 
-| Tool | Status |
-|------|--------|
-| `generate_test_suite` | ✅ build a runnable `.xlsx` suite from an OpenAPI YAML spec |
-| `read_test_suite` | ✅ parse a `.numbers`/`.xlsx` suite into structured cases |
-| `assert_response` | ✅ `exact` / `json_subset` / `schema` / `status_only` (+ `ignore_paths`, `<<any>>`) |
-| `call_api` | ✅ httpx runner, column-driven, stamps `X-Correlation-ID` |
-| `snapshot_logs` | ✅ download logs once (file mock **or** Anypoint/CloudHub) |
-| `validate_logs` | ✅ check `expected_log_strings`, correlation-scoped with whole-log fallback |
-| `run_suite` | ✅ batched: call + assert → one log snapshot per run → validate → report |
-| `run_and_record` | ✅ end-to-end: `run_suite` **+** append a timestamped results block to the sheet |
-| `get_auth_token` | 🚧 stub — only needed when a case sets `auth_required=yes` |
+The server exposes exactly **three primary tools** to keep the client interface clean and prevent token bloat:
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `create_test_suite_from_schema` | `schema_path`, `output_path` | Generates a runnable `.xlsx` test suite from an OpenAPI 3.0 spec. Walks all paths and methods. *(Does not run tests)* |
+| `create_test_suite_from_application` | `app_root`, `output_path` | Generates a runnable `.xlsx` test suite from a MuleSoft app directory by parsing its XML flow logic and routing branches. *(Does not run tests)* |
+| `run_test_suite` | `suite_path`, `job_id` | Runs the test suite in the background. Return `job_id` to start, then query with `job_id` to get `progress_percent` status and final reports (prevents stdio timeouts). |
+
 
 ## Prerequisites
 

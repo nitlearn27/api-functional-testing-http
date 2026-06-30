@@ -2,9 +2,9 @@
  * generate_test_suite — build a runnable .xlsx suite from an OpenAPI 3.0 YAML spec.
  *
  * Faithful port of tools/suite_generator.py. The only boundary change: it takes the spec YAML
- * as text and returns the workbook as bytes (base64-encoded by the MCP tool) instead of reading
- * a path and writing a file. Coverage logic is deliberately `/products`-specific, exactly as the
- * Python reference — a positive case per operation plus one negative per validation rule.
+ * text and returns the workbook as bytes (base64-encoded by the MCP tool) instead of reading
+ * a path and writing a file. Coverage logic is fully generic (no fixed/hard-coded paths) —
+ * a positive case per operation plus one negative per validation rule.
  */
 import * as XLSX from "xlsx";
 import { parse as parseYaml } from "yaml";

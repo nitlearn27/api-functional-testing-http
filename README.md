@@ -34,8 +34,8 @@ The server exposes exactly **three primary tools** to keep the client interface 
 ## Quick start
 
 ```bash
-git clone https://github.com/nitesh22778844/api-functional-testing.git
-cd api-functional-testing
+git clone https://github.com/nitlearn27/api-functional-testing-http.git
+cd api-functional-testing-http
 
 uv sync --all-extras --dev      # create env + install deps from uv.lock
 uv run ruff check .             # lint
